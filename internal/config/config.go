@@ -10,6 +10,7 @@ import (
 	"github.com/cli/go-gh/v2/pkg/term"
 
 	ghapi "github.com/github/gh-stack/internal/github"
+	"github.com/github/gh-stack/internal/stack"
 	"github.com/github/gh-stack/internal/theme"
 )
 
@@ -70,9 +71,28 @@ type Config struct {
 type StackMutationContext struct {
 	CommonDir string
 	StateDir  string
+	Kind      string
 
 	// NoCheckoutOnSelect preserves rewrite origins and range anchors.
 	NoCheckoutOnSelect bool
+
+	// Operation holds this command's claim. It is nil until the command
+	// claims something, and for recovery of a journal that predates claims.
+	Operation *stack.Operation
+
+	// Adopted is a completed modify whose pending journal this command
+	// consumes.
+	Adopted *stack.Operation
+
+	// Borrowed lists worktrees claimed for a short step, to be returned.
+	Borrowed []string
+
+	// UnclaimedJournal keeps journals beside the catalog, where releases
+	// before per-operation journals wrote them.
+	UnclaimedJournal bool
+
+	// RestoreJournal undoes the journal binding of Operation or Adopted.
+	RestoreJournal func()
 }
 
 // New creates a new Config with terminal-aware output and color support.

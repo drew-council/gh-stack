@@ -169,8 +169,10 @@ an ancestor of the branch.
 
 - Stacks are strictly linear: one parent, at most one child. Use separate stacks for parallel work.
 - `rebase` and `sync` automatically update affected clean worktrees; they never auto-stash or
-  create/remove worktrees. Mutations serialize across the clone, and paused operations require
-  recovery in their recorded owners.
+  create/remove worktrees. Commands on independent stacks in different worktrees run at the same
+  time. Commands on one stack or in one worktree serialize: the second waits 5 seconds, then exits
+  8. A paused operation holds only its own stack and worktrees, and requires recovery in its
+  recorded owners.
 - `modify` supports distributed stack branches, but its editor remains TUI-only. Actions run in
   affected clean owners; unoccupied branches use the origin. Drop/fold source branches and
   worktrees are preserved. Recovery flags may run from any worktree and use recorded native

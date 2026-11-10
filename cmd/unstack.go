@@ -115,8 +115,10 @@ func runUnstack(cfg *config.Config, opts *unstackOptions) error {
 func unstackTrackedStack(cfg *config.Config, opts *unstackOptions, result *loadStackResult) error {
 	gitDir := result.GitDir
 
-	sf := result.StackFile
-	s := result.Stack
+	sf, s, err := claimStack(cfg, gitDir, result.StackFile, result.Stack)
+	if err != nil {
+		return stackLookupError(err)
+	}
 
 	// Unstack on GitHub first (unless --local). The server decides which PRs
 	// can be removed; successful partial unstacking still removes local tracking.

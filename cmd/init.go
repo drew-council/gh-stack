@@ -77,6 +77,10 @@ func runInit(cfg *config.Config, opts *initOptions) error {
 	if err != nil {
 		return err
 	}
+	// Claim the branches of the new stack before creating any of them.
+	if err := claim(cfg, opts.branches, nil); err != nil {
+		return err
+	}
 
 	// Determine trunk branch
 	trunk := opts.base
@@ -179,6 +183,11 @@ func runInit(cfg *config.Config, opts *initOptions) error {
 		if interactiveAdopted {
 			adopted[branches[0]] = true
 		}
+	}
+
+	// Names chosen interactively are known only now.
+	if err := claim(cfg, branches, nil); err != nil {
+		return err
 	}
 
 	// --- Build stack ---

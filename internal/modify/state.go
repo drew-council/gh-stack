@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"slices"
 	"time"
 
@@ -22,7 +21,7 @@ const (
 )
 
 // StateFile holds the state of an in-progress or pending-submit modify operation.
-// It is stored at <common-dir>/gh-stack-modify-state.
+// It is stored in the operation's record under <common-dir>/gh-stack-operations.
 type StateFile struct {
 	SchemaVersion         int               `json:"schema_version"`
 	StackName             string            `json:"stack_name"`
@@ -83,9 +82,14 @@ type Action struct {
 	Target      string `json:"target,omitempty"`       // fold receiver, insertion parent, or normalization drop
 }
 
-// StatePath returns the full path to the modify state file.
+// StateFileName is the name of the modify journal.
+const StateFileName = stateFileName
+
+// StatePath returns the full path to the modify state file: beside the
+// catalog in gitDir, or in the directory of the operation the running command
+// bound to it.
 func StatePath(gitDir string) string {
-	return filepath.Join(gitDir, stateFileName)
+	return stack.JournalPath(gitDir, stateFileName)
 }
 
 // LoadState reads the modify state file from the git directory.

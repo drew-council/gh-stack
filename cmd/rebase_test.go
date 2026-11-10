@@ -485,7 +485,7 @@ func TestRebase_ConflictSavesState(t *testing.T) {
 	assert.Contains(t, output, "--continue")
 
 	// Verify state file was saved
-	stateData, readErr := os.ReadFile(filepath.Join(tmpDir, "gh-stack-rebase-state"))
+	stateData, readErr := os.ReadFile(filepath.Join(pausedOperationDir(t, tmpDir), "gh-stack-rebase-state"))
 	require.NoError(t, readErr, "rebase state file should be saved")
 
 	var state rebaseState
@@ -587,8 +587,7 @@ func TestRebase_Abort_RestoresBranches(t *testing.T) {
 	assert.Equal(t, "orig-sha-b3", resetMap["b3"])
 
 	// State file should be removed
-	_, err = os.Stat(filepath.Join(tmpDir, "gh-stack-rebase-state"))
-	assert.True(t, os.IsNotExist(err), "state file should be removed after abort")
+	assertNoJournal(t, tmpDir, rebaseStateFile)
 
 	// Should return to original branch
 	assert.Contains(t, checkouts, "b1", "should checkout original branch at end")
@@ -1168,8 +1167,7 @@ func TestRebase_Continue_RebasesRemainingBranches(t *testing.T) {
 	assert.Equal(t, rebaseCall{"b2", "b2-orig-sha", "b3"}, rebaseCalls[0])
 
 	// State file should be removed after success
-	_, statErr := os.Stat(filepath.Join(tmpDir, "gh-stack-rebase-state"))
-	assert.True(t, os.IsNotExist(statErr), "state file should be removed after success")
+	assertNoJournal(t, tmpDir, rebaseStateFile)
 
 	// Original branch should be checked out at the end
 	assert.Contains(t, checkouts, "b1", "should checkout original branch")
@@ -1308,8 +1306,7 @@ func TestRebase_Continue_OntoMode(t *testing.T) {
 	assert.True(t, rebaseContinueCalled, "RebaseContinue should be called")
 
 	// State file should be removed after success
-	_, statErr := os.Stat(filepath.Join(tmpDir, "gh-stack-rebase-state"))
-	assert.True(t, os.IsNotExist(statErr), "state file should be removed after success")
+	assertNoJournal(t, tmpDir, rebaseStateFile)
 }
 
 // TestRebase_Continue_ConflictOnRemaining verifies that when --continue
@@ -1455,8 +1452,7 @@ func TestRebase_Abort_WithActiveRebase(t *testing.T) {
 	assert.Equal(t, "orig-sha-b2", resetMap["b2"])
 
 	// State file should be removed
-	_, statErr := os.Stat(filepath.Join(tmpDir, "gh-stack-rebase-state"))
-	assert.True(t, os.IsNotExist(statErr), "state file should be removed after abort")
+	assertNoJournal(t, tmpDir, rebaseStateFile)
 
 	// Should return to original branch
 	assert.Contains(t, checkouts, "b1", "should checkout original branch at end")
@@ -1938,7 +1934,7 @@ func TestRebase_ConflictSavesCommitterDateFlag(t *testing.T) {
 	_ = cmd.Execute()
 
 	// Load the saved state and verify the flag is persisted.
-	loaded, err := loadRebaseState(tmpDir)
+	loaded, err := loadRebaseState(pausedOperationDir(t, tmpDir))
 	require.NoError(t, err)
 	assert.True(t, loaded.CommitterDateIsAuthorDate,
 		"saved rebase state should preserve CommitterDateIsAuthorDate flag")
@@ -2164,7 +2160,7 @@ func TestRebase_NoTrunk_ConflictSavesState(t *testing.T) {
 	_ = cmd.Execute()
 
 	// Load the saved state and verify the NoTrunk flag is persisted.
-	loaded, err := loadRebaseState(tmpDir)
+	loaded, err := loadRebaseState(pausedOperationDir(t, tmpDir))
 	require.NoError(t, err)
 	assert.True(t, loaded.NoTrunk,
 		"saved rebase state should preserve NoTrunk flag")
@@ -2468,7 +2464,7 @@ func assertIssue512History(t *testing.T, repo issue512Repo) {
 	trunk := issue250Git(t, repo.dir, "rev-parse", "origin/main")
 	assert.Equal(t, trunk, sf.Stacks[0].Trunk.Head)
 	assert.Equal(t, trunk, sf.Stacks[0].Branches[1].Base)
-	assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+	assertNoJournal(t, repo.gitDir, rebaseStateFile)
 }
 
 func testIssue512StaleMergedParent(t *testing.T, run func(*config.Config) error) {
@@ -2639,7 +2635,7 @@ func TestRebase_Issue512WorktreeRecovery(t *testing.T) {
 			cfg := issue512Config(t, repo.mergedHead)
 			require.ErrorIs(t, runRebase(cfg, &rebaseOptions{remote: "origin"}), ErrConflict)
 
-			state, err := loadRebaseState(repo.gitDir)
+			state, err := loadRebaseState(pausedOperationDir(t, repo.gitDir))
 			require.NoError(t, err)
 			assert.Equal(t, repo.mergedHead, state.RebaseOldBase)
 			assert.Equal(t, repo.mergedHead, state.OriginalStack.Branches[0].PullRequest.MergedHead)
@@ -2660,7 +2656,7 @@ func TestRebase_Issue512WorktreeRecovery(t *testing.T) {
 			assert.Equal(t, "main", issue250Git(t, repo.dir, "branch", "--show-current"))
 			assert.Equal(t, "parent", issue250Git(t, parentDir, "branch", "--show-current"))
 			assert.Equal(t, "child", issue250Git(t, childDir, "branch", "--show-current"))
-			assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+			assertNoJournal(t, repo.gitDir, rebaseStateFile)
 			if action == "abort" {
 				assert.Equal(t, childBefore, issue250Git(t, repo.dir, "rev-parse", "child"))
 			} else {
@@ -2984,7 +2980,7 @@ func TestRebase_SharedTrunkSelectionPreservesOriginAndRange(t *testing.T) {
 
 			assert.Equal(t, tc.want, rebased)
 			assert.Equal(t, "main", current)
-			assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+			assertNoJournal(t, dir, rebaseStateFile)
 		})
 	}
 }
@@ -3001,7 +2997,7 @@ func TestRebase_SharedTrunkSelectionRecoveryPreservesOrigin(t *testing.T) {
 			cfg.SelectFn = func(_, _ string, _ []string) (int, error) { selections++; return 0, nil }
 			cfg.ConfirmFn = func(string, bool) (bool, error) { return false, nil }
 			require.ErrorIs(t, runRebase(cfg, &rebaseOptions{remote: "origin"}), ErrConflict)
-			state, err := loadRebaseState(repo.gitDir)
+			state, err := loadRebaseState(pausedOperationDir(t, repo.gitDir))
 			require.NoError(t, err)
 			assert.Equal(t, "main", state.OriginalBranch)
 			if !abort {
@@ -3016,7 +3012,7 @@ func TestRebase_SharedTrunkSelectionRecoveryPreservesOrigin(t *testing.T) {
 			assert.Equal(t, "parent", issue250Git(t, repo.parentDir, "branch", "--show-current"))
 			assert.Equal(t, observerHead, issue250Git(t, repo.childDir, "rev-parse", "HEAD"))
 			assert.Equal(t, 1, selections)
-			assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+			assertNoJournal(t, repo.gitDir, rebaseStateFile)
 		})
 	}
 }
@@ -3042,8 +3038,7 @@ func TestRebase_WorktreesPreserveCheckouts(t *testing.T) {
 	sf, err := stack.Load(repo.gitDir)
 	require.NoError(t, err)
 	assert.Equal(t, issue250Git(t, repo.dir, "rev-parse", "parent"), sf.Stacks[0].Branches[1].Base)
-	_, err = os.Stat(filepath.Join(repo.gitDir, rebaseStateFile))
-	assert.ErrorIs(t, err, os.ErrNotExist)
+	assertNoJournal(t, repo.gitDir, rebaseStateFile)
 }
 
 func TestRebase_WorktreesDirtyTargetFailsBeforeMutation(t *testing.T) {
@@ -3059,8 +3054,7 @@ func TestRebase_WorktreesDirtyTargetFailsBeforeMutation(t *testing.T) {
 	assert.Equal(t, parentBefore, issue250Git(t, repo.dir, "rev-parse", "parent"))
 	assert.Equal(t, childBefore, issue250Git(t, repo.dir, "rev-parse", "child"))
 	assert.FileExists(t, filepath.Join(repo.parentDir, "uncommitted.txt"))
-	_, err := os.Stat(filepath.Join(repo.gitDir, rebaseStateFile))
-	assert.ErrorIs(t, err, os.ErrNotExist)
+	assertNoJournal(t, repo.gitDir, rebaseStateFile)
 }
 
 func TestRebase_WorktreesConflictContinueFromDifferentWorktree(t *testing.T) {
@@ -3069,7 +3063,7 @@ func TestRebase_WorktreesConflictContinueFromDifferentWorktree(t *testing.T) {
 	cfg := issue250TestConfig(t)
 	require.ErrorIs(t, runRebase(cfg, &rebaseOptions{remote: "origin"}), ErrConflict)
 
-	state, err := loadRebaseState(repo.gitDir)
+	state, err := loadRebaseState(pausedOperationDir(t, repo.gitDir))
 	require.NoError(t, err)
 	require.NotNil(t, state.Worktrees)
 	assert.True(t, worktree.SamePath(repo.childDir, state.Worktrees.Location("child").Path))
@@ -3085,8 +3079,7 @@ func TestRebase_WorktreesConflictContinueFromDifferentWorktree(t *testing.T) {
 	assert.Equal(t, "parent", issue250Git(t, repo.parentDir, "branch", "--show-current"))
 	assert.Equal(t, "child", issue250Git(t, repo.childDir, "branch", "--show-current"))
 	require.NoError(t, issue250GitMayFail(t, repo.dir, "merge-base", "--is-ancestor", "parent", "child"))
-	_, err = os.Stat(filepath.Join(repo.gitDir, rebaseStateFile))
-	assert.ErrorIs(t, err, os.ErrNotExist)
+	assertNoJournal(t, repo.gitDir, rebaseStateFile)
 }
 
 func TestRebase_RecoveryFindsMovedOrigin(t *testing.T) {
@@ -3106,7 +3099,7 @@ func TestRebase_RecoveryFindsMovedOrigin(t *testing.T) {
 	assert.False(t, requireGitState(t, requireWorktree(t, git.CurrentOps(), moved).IsRebaseInProgress))
 	assert.Equal(t, childBefore, issue250Git(t, moved, "rev-parse", "child"))
 	assert.Equal(t, "child", issue250Git(t, moved, "branch", "--show-current"))
-	assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+	assertNoJournal(t, repo.gitDir, rebaseStateFile)
 }
 
 func TestRebase_WorktreesAbortRetainsRecoveryForNewEdits(t *testing.T) {
@@ -3125,15 +3118,14 @@ func TestRebase_WorktreesAbortRetainsRecoveryForNewEdits(t *testing.T) {
 	assert.Equal(t, parentRebased, issue250Git(t, repo.dir, "rev-parse", "parent"))
 	assert.Equal(t, childBefore, issue250Git(t, repo.dir, "rev-parse", "child"))
 	assert.FileExists(t, filepath.Join(repo.parentDir, "new-work.txt"))
-	assert.FileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+	assert.FileExists(t, filepath.Join(pausedOperationDir(t, repo.gitDir), rebaseStateFile))
 
 	require.NoError(t, os.Remove(filepath.Join(repo.parentDir, "new-work.txt")))
 	require.NoError(t, runRebase(cfg, &rebaseOptions{abort: true}))
 	assert.Equal(t, parentBefore, issue250Git(t, repo.dir, "rev-parse", "parent"))
 	assert.Equal(t, childBefore, issue250Git(t, repo.dir, "rev-parse", "child"))
 	assert.Equal(t, "main", issue250Git(t, repo.dir, "branch", "--show-current"))
-	_, err := os.Stat(filepath.Join(repo.gitDir, rebaseStateFile))
-	assert.ErrorIs(t, err, os.ErrNotExist)
+	assertNoJournal(t, repo.gitDir, rebaseStateFile)
 }
 
 func TestRebase_WorktreesUpstackDoesNotRequireDirtyLowerWorktree(t *testing.T) {
@@ -3196,8 +3188,7 @@ func TestRebase_ContinueWithRemainingBranchInConflictWorktree(t *testing.T) {
 	require.NoError(t, issue250GitMayFail(t, repo.dir, "merge-base", "--is-ancestor", "child", "grandchild"))
 	assert.Equal(t, "main", issue250Git(t, repo.dir, "branch", "--show-current"))
 	assert.False(t, requireGitState(t, git.IsRebaseInProgress))
-	_, err = os.Stat(filepath.Join(repo.gitDir, rebaseStateFile))
-	assert.ErrorIs(t, err, os.ErrNotExist)
+	assertNoJournal(t, repo.gitDir, rebaseStateFile)
 }
 
 func TestRebase_LegacyPrivateRecoveryKeepsOriginalCatalog(t *testing.T) {
@@ -3226,7 +3217,7 @@ func TestRebase_LegacyPrivateRecoveryKeepsOriginalCatalog(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "sha-b1", sf.Stacks[0].Branches[0].Head)
 	assert.FileExists(t, filepath.Join(private, "gh-stack"))
-	assert.NoFileExists(t, filepath.Join(private, rebaseStateFile))
+	assertNoJournal(t, private, rebaseStateFile)
 	assert.NoFileExists(t, filepath.Join(common, "gh-stack-migration"))
 }
 
@@ -3271,7 +3262,7 @@ func TestRebase_AbortRetainsPartialRestore(t *testing.T) {
 	require.NoError(t, runRebase(cfg, &rebaseOptions{abort: true}))
 	assert.Equal(t, "old-b2", refs["b2"])
 	assert.Equal(t, "b1", current)
-	assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+	assertNoJournal(t, dir, rebaseStateFile)
 }
 
 func TestRebase_CompletedJournalSurvivesCatalogSaveFailure(t *testing.T) {
@@ -3305,7 +3296,7 @@ func TestRebase_CompletedJournalSurvivesCatalogSaveFailure(t *testing.T) {
 
 	lock.Unlock()
 	require.NoError(t, runRebase(cfg, &rebaseOptions{cont: true}))
-	assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+	assertNoJournal(t, dir, rebaseStateFile)
 }
 
 func TestRebase_CompletedRecoveryPreservesNewWork(t *testing.T) {
@@ -3339,7 +3330,7 @@ func TestRebase_CompletedRecoveryPreservesNewWork(t *testing.T) {
 					assert.Equal(t, ctx.Touched, retained.Worktrees.Touched)
 				} else {
 					require.NoError(t, err)
-					assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+					assertNoJournal(t, dir, rebaseStateFile)
 				}
 				assert.Equal(t, busy, requireGitState(t, mock.IsRebaseInProgress))
 				dirty, err := mock.HasUncommittedChanges()
@@ -3503,8 +3494,7 @@ func TestRebase_LegacyContinuePersistsCatalogUnderOperationLock(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "new-b1", sf.Stacks[0].Branches[0].Head)
 	assert.Equal(t, "sha-main", sf.Stacks[0].Branches[0].Base)
-	_, err = os.Stat(filepath.Join(dir, rebaseStateFile))
-	assert.ErrorIs(t, err, os.ErrNotExist)
+	assertNoJournal(t, dir, rebaseStateFile)
 }
 
 func TestRebase_LegacyContinueKeepsNamedTrunkForForkPoint(t *testing.T) {
@@ -3542,7 +3532,7 @@ func TestRebase_LegacyContinueKeepsNamedTrunkForForkPoint(t *testing.T) {
 	defer restore()
 	require.NoError(t, runRebase(issue250TestConfig(t), &rebaseOptions{cont: true}))
 	assert.True(t, rebased)
-	assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+	assertNoJournal(t, dir, rebaseStateFile)
 }
 
 func TestRebase_LegacyPhaseGuards(t *testing.T) {
@@ -3615,7 +3605,7 @@ func TestRebase_LegacyCompleteOnlyPublishes(t *testing.T) {
 	require.NoError(t, runRebase(issue250TestConfig(t), &rebaseOptions{cont: true}))
 
 	assert.True(t, requireGitState(t, mock.IsRebaseInProgress))
-	assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+	assertNoJournal(t, dir, rebaseStateFile)
 }
 
 func TestRebase_LegacyCompleteAbortPreservesNewNativeOperation(t *testing.T) {
@@ -3704,7 +3694,7 @@ func TestRebase_LegacyAbortRetainsFailures(t *testing.T) {
 			require.NoError(t, runRebase(cfg, &rebaseOptions{abort: true}))
 			assert.Equal(t, state.OriginalRefs, refs)
 			assert.Equal(t, "main", current)
-			assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+			assertNoJournal(t, dir, rebaseStateFile)
 		})
 	}
 }
@@ -3759,7 +3749,7 @@ func TestRebase_LegacyContinueRollbackRetainsJournal(t *testing.T) {
 			failing = false
 			require.NoError(t, runRebase(cfg, &rebaseOptions{abort: true}))
 			assert.Equal(t, state.OriginalRefs, refs)
-			assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+			assertNoJournal(t, dir, rebaseStateFile)
 		})
 	}
 }
@@ -3819,7 +3809,7 @@ func TestRebase_LegacyCompletionRetainsRetryState(t *testing.T) {
 			require.NoError(t, runRebase(cfg, &rebaseOptions{cont: true}))
 			assert.Equal(t, 1, continues, "completed publication must not repeat native continuation")
 			assert.Equal(t, "main", current)
-			assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+			assertNoJournal(t, dir, rebaseStateFile)
 		})
 	}
 }
@@ -3944,7 +3934,7 @@ func TestRebase_BaseRetargetConsent(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, string(catalog), string(after))
 			assert.Equal(t, top, issue250Git(t, repo.dir, "rev-parse", "top"))
-			assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+			assertNoJournal(t, repo.gitDir, rebaseStateFile)
 		})
 	}
 }
@@ -3965,7 +3955,7 @@ func TestRebase_BaseRetargetRecovery(t *testing.T) {
 			top := issue250Git(t, repo.dir, "rev-parse", "top")
 
 			require.ErrorIs(t, runRebase(cfg, &rebaseOptions{remote: "origin"}), ErrConflict)
-			state, err := loadRebaseState(repo.gitDir)
+			state, err := loadRebaseState(pausedOperationDir(t, repo.gitDir))
 			require.NoError(t, err)
 			assert.Equal(t, "main", state.TargetTrunk)
 			sf, err := stack.Load(repo.gitDir)
@@ -3987,7 +3977,7 @@ func TestRebase_BaseRetargetRecovery(t *testing.T) {
 				assert.Equal(t, repo.oldParent, sf.Stacks[0].Branches[0].Base)
 				assert.Equal(t, top, issue250Git(t, repo.dir, "rev-parse", "top"))
 			}
-			assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+			assertNoJournal(t, repo.gitDir, rebaseStateFile)
 		})
 	}
 }
@@ -4015,7 +4005,7 @@ func TestRebase_BaseRetargetCompletedJournal(t *testing.T) {
 			require.NoError(t, err)
 			want := map[string]string{"continue": "main", "abort": "parent"}[action]
 			assert.Equal(t, want, sf.Stacks[0].Trunk.Branch)
-			assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+			assertNoJournal(t, dir, rebaseStateFile)
 		})
 	}
 }
@@ -4149,7 +4139,7 @@ func testBaseRetargetReviewCases(t *testing.T, run func(*config.Config, bool) er
 				require.NoError(t, readErr)
 				assert.Equal(t, before, after)
 				assert.Equal(t, refs, issue250Git(t, repo.dir, "rev-parse", "child", "top", "origin/child", "origin/top"))
-				assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+				assertNoJournal(t, repo.gitDir, rebaseStateFile)
 				if scenario == "missing cutoff" {
 					return
 				}

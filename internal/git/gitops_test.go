@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	cligit "github.com/cli/cli/v2/git"
@@ -1916,4 +1917,98 @@ func TestIntegration_Push_FallsBackWithoutPushOptionSupport(t *testing.T) {
 	d := &defaultOps{}
 	require.NoError(t, d.Push("origin", []string{"b1"}, true, true))
 	assert.Equal(t, gitExec(t, cloneDir, "rev-parse", "b1"), remoteBranchSHA(t, bareDir, "b1"))
+}
+
+// Commands on stacks that share a trunk fetch it at the same time. Each fetch
+// reads the refs it will update before it talks to the remote, so all but one
+// find the tracking ref, and any tag that comes with it, changed under them.
+func TestIntegration_ConcurrentFetchesOfOneRef(t *testing.T) {
+	bareDir, cloneDir := setupBareAndClone(t)
+	// Commits arrive from another clone, so this one has to fetch them.
+	pusher := filepath.Join(t.TempDir(), "pusher")
+	gitExec(t, ".", "clone", bareDir, pusher)
+	if runtime.GOOS != "windows" {
+		// Delay the remote's pack generation, as a network would.
+		hook := filepath.Join(t.TempDir(), "slow-pack")
+		require.NoError(t, os.WriteFile(hook, []byte("#!/bin/sh\nsleep 0.2\nexec \"$@\"\n"), 0755))
+		global := filepath.Join(t.TempDir(), "gitconfig")
+		require.NoError(t, os.WriteFile(global, []byte("[uploadpack]\n\tpackObjectsHook = "+hook+"\n"), 0644))
+		t.Setenv("GIT_CONFIG_GLOBAL", global)
+	}
+
+	const fetchers = 4
+	clients := make([]*defaultOps, fetchers)
+	for i := range clients {
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("worktree %d", i))
+		gitExec(t, cloneDir, "worktree", "add", "--detach", path, "main")
+		clients[i] = &defaultOps{client: &cligit.Client{RepoDir: path}}
+	}
+	for round := range 3 {
+		tag := fmt.Sprintf("v%d", round)
+		writeFile(t, pusher, "trunk.txt", fmt.Sprintf("round %d", round))
+		gitExec(t, pusher, "add", ".")
+		gitExec(t, pusher, "commit", "-m", fmt.Sprintf("round %d", round))
+		gitExec(t, pusher, "tag", tag)
+		gitExec(t, pusher, "push", "origin", "main", tag)
+		want := gitExec(t, pusher, "rev-parse", "main")
+
+		errs := make([]error, fetchers)
+		var wg sync.WaitGroup
+		for i, client := range clients {
+			wg.Go(func() {
+				if i%2 == 0 {
+					errs[i] = client.FetchBranch("origin", "main")
+				} else {
+					errs[i] = client.FetchBranches("origin", []string{"main"})
+				}
+			})
+		}
+		wg.Wait()
+		for i, err := range errs {
+			require.NoError(t, err, "round %d fetcher %d", round, i)
+		}
+		assert.Equal(t, want, gitExec(t, cloneDir, "rev-parse", "refs/remotes/origin/main"))
+		assert.Equal(t, want, gitExec(t, cloneDir, "rev-parse", "refs/tags/"+tag+"^{commit}"))
+	}
+}
+
+// Git fails a config write when another process holds the config lock, so
+// commands that run side by side take turns at writes to the shared config.
+func TestIntegration_ConcurrentConfigWrites(t *testing.T) {
+	_, cloneDir := setupBareAndClone(t)
+	const writers, rounds = 8, 12
+	clients := make([]*defaultOps, writers)
+	for i := range clients {
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("worktree %d", i))
+		gitExec(t, cloneDir, "worktree", "add", "--detach", path, "main")
+		clients[i] = &defaultOps{client: &cligit.Client{RepoDir: path}}
+	}
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for i, client := range clients {
+		wg.Go(func() {
+			for round := range rounds {
+				created, renamed := fmt.Sprintf("created-%d-%d", i, round), fmt.Sprintf("renamed-%d-%d", i, round)
+				// Each step rewrites the branch's upstream section.
+				for _, step := range []func() error{
+					func() error { return client.CreateBranch(created, "origin/main") },
+					func() error { return client.RenameBranch(created, renamed) },
+					func() error { return client.SaveRemote("origin") },
+					func() error { return client.DeleteBranch(renamed, true) },
+				} {
+					if err := step(); err != nil {
+						errs <- fmt.Errorf("writer %d round %d: %w", i, round, err)
+						return
+					}
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	assert.NotContains(t, gitExec(t, cloneDir, "config", "--list", "--local"), "branch.created-")
+	assert.NotContains(t, gitExec(t, cloneDir, "config", "--list", "--local"), "branch.renamed-")
 }

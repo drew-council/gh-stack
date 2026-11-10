@@ -157,6 +157,10 @@ func runSync(cfg *config.Config, opts *syncOptions) error {
 		// outcome, so just exit successfully.
 		return nil
 	}
+	// Reconciling may have changed which branches the stack has.
+	if err := reclaimStack(cfg, sf, s); err != nil {
+		return err
+	}
 	// Reconciling "use remote as source of truth" may have moved us off a
 	// branch that is no longer in the stack, so re-read the current branch.
 	if cb, cbErr := git.CurrentBranch(); cbErr == nil {
@@ -167,6 +171,10 @@ func runSync(cfg *config.Config, opts *syncOptions) error {
 	if err != nil {
 		cfg.Errorf("failed to read the stack's base on GitHub: %v", err)
 		return ErrAPIFailure
+	}
+	// A new base that is a branch of another stack moves with that stack.
+	if err := claim(cfg, dependentTrunk(sf, newBase), nil); err != nil {
+		return err
 	}
 	ctx, err := worktree.New()
 	if err != nil {
@@ -455,7 +463,7 @@ func runSync(cfg *config.Config, opts *syncOptions) error {
 				}
 				if switchTarget == "" {
 					cfg.Infof("Keeping %s: no available checkout destination", currentBranch)
-				} else if err := git.CheckoutBranch(switchTarget); err != nil {
+				} else if err := worktree.CheckoutUnclaimed(git.CurrentOps(), switchTarget); err != nil {
 					cfg.Warningf("Failed to switch from %s to %s: %v", currentBranch, switchTarget, err)
 				} else {
 					currentBranch = switchTarget

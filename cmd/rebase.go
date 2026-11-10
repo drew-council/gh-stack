@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	cligit "github.com/cli/cli/v2/git"
@@ -212,6 +211,10 @@ func runRebase(cfg *config.Config, opts *rebaseOptions) error {
 		if newBase, err = retargetedBase(cfg, s, remote); err != nil {
 			cfg.Errorf("failed to read the stack's base on GitHub: %v", err)
 			return ErrAPIFailure
+		}
+		// A new base that is a branch of another stack moves with that stack.
+		if err := claim(cfg, dependentTrunk(sf, newBase), nil); err != nil {
+			return err
 		}
 		if i := s.FirstActiveBranchIndex(); newBase != "" && i >= 0 && (i < startIdx || i >= endIdx) {
 			cfg.Errorf("rebase the whole stack to move it onto %s", newBase)
@@ -635,7 +638,7 @@ func restoreRebaseCheckout(branch string) error {
 	if err := worktree.CheckClean(git.CurrentOps(), root); err != nil {
 		return err
 	}
-	if err := git.CheckoutBranch(branch); err != nil {
+	if err := worktree.CheckoutUnclaimed(git.CurrentOps(), branch); err != nil {
 		return fmt.Errorf("restoring original checkout %s: %w", branch, err)
 	}
 	return nil
@@ -682,14 +685,14 @@ func saveRebaseState(gitDir string, state *rebaseState) error {
 	if err != nil {
 		return fmt.Errorf("error serializing rebase state: %w", err)
 	}
-	if err := stack.WriteAtomic(filepath.Join(gitDir, rebaseStateFile), data); err != nil {
+	if err := stack.WriteAtomic(stack.JournalPath(gitDir, rebaseStateFile), data); err != nil {
 		return fmt.Errorf("error writing rebase state: %w", err)
 	}
 	return nil
 }
 
 func loadRebaseState(gitDir string) (*rebaseState, error) {
-	data, err := stack.ReadStateFile(filepath.Join(gitDir, rebaseStateFile))
+	data, err := stack.ReadStateFile(stack.JournalPath(gitDir, rebaseStateFile))
 	if err != nil {
 		return nil, err
 	}
@@ -718,7 +721,7 @@ func validateRebaseExecutionMode(state *rebaseState) error {
 }
 
 func clearRebaseState(gitDir string) error {
-	err := os.Remove(filepath.Join(gitDir, rebaseStateFile))
+	err := os.Remove(stack.JournalPath(gitDir, rebaseStateFile))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}

@@ -146,6 +146,17 @@ func runModify(cfg *config.Config) error {
 		return fmt.Errorf("the current branch changed while modify was open; reopen modify before applying")
 	}
 
+	// Renamed and inserted branches join the stack, and so its claim.
+	var created []string
+	for _, action := range modify.BuildPlan(reordered) {
+		if action.NewName != "" {
+			created = append(created, action.NewName)
+		}
+	}
+	if err := claim(cfg, created, nil); err != nil {
+		return err
+	}
+
 	applyResult, conflict, applyErr := modify.ApplyPlan(cfg, gitDir, s, sf, reordered, currentBranch, updateBaseSHAs)
 
 	if conflict != nil {
@@ -317,6 +328,12 @@ func checkModifyPreconditions(cfg *config.Config) (*loadStackResult, error) {
 	if err := checkNoModifyInProgress(cfg, gitDir); err != nil {
 		return nil, err
 	}
+	if pending, err := hasPendingModify(cfg, s); err != nil {
+		return nil, err
+	} else if pending {
+		reportPendingModify(cfg)
+		return nil, ErrSilent
+	}
 
 	// No rebase in progress
 	inProgress, err := git.IsRebaseInProgress()
@@ -412,12 +429,16 @@ func checkNoModifyInProgress(cfg *config.Config, gitDir string) error {
 			cfg.ColorAccent("gh stack modify --abort"))
 		return ErrSilent
 	case modify.PhasePendingSubmit:
-		cfg.Errorf("a modify was completed but the stack has not been submitted yet")
-		cfg.Printf("Run `%s` to push changes and recreate the stack on GitHub",
-			cfg.ColorAccent("gh stack submit"))
+		reportPendingModify(cfg)
 		return ErrSilent
 	default:
 		cfg.Errorf("unexpected modify state phase: %s", state.Phase)
 		return ErrSilent
 	}
+}
+
+func reportPendingModify(cfg *config.Config) {
+	cfg.Errorf("a modify was completed but the stack has not been submitted yet")
+	cfg.Printf("Run `%s` to push changes and recreate the stack on GitHub",
+		cfg.ColorAccent("gh stack submit"))
 }

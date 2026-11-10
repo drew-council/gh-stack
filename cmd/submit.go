@@ -116,6 +116,13 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 		return ErrDisambiguate
 	}
 	s := stacks[0]
+	if sf, s, err = claimStack(cfg, gitDir, sf, s); err != nil {
+		return stackLookupError(err)
+	}
+	// A completed modify of this stack left its journal for submit.
+	if err := adoptPendingModify(cfg, s); err != nil {
+		return err
+	}
 
 	client, err := cfg.GitHubClient()
 	if err != nil {

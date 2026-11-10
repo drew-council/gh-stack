@@ -239,6 +239,7 @@ func ApplyPlan(
 
 	// Update base SHAs
 	updateBaseSHAs(s)
+	recordPinnedBase(stateFile, s)
 
 	// Update state file phase — only require submit when PRs are affected
 	result.NeedsSubmit = s.ID != "" && stateFile.AffectsPRs
@@ -274,19 +275,20 @@ func rebaseRemaining(cfg *config.Config, dir string, state *StateFile, s *stack.
 		if err := checkExpectedRef(state, newBase); err != nil {
 			return moved, nil, err
 		}
+		target := baseRef(state, newBase)
 		oldBase := state.OriginalRefs[name]
 		if oldBase == "" {
-			oldBase, err = ops.MergeBase(newBase, name)
+			oldBase, err = ops.MergeBase(target, name)
 			if err != nil {
 				return moved, nil, fmt.Errorf("finding original base for %s: %w", name, err)
 			}
 		}
-		ancestor, err := ops.IsAncestor(newBase, name)
+		ancestor, err := ops.IsAncestor(target, name)
 		if err != nil {
 			return moved, nil, fmt.Errorf("checking ancestry of %s: %w", name, err)
 		}
 		if ancestor {
-			base, err := ops.MergeBase(newBase, name)
+			base, err := ops.MergeBase(target, name)
 			if err != nil {
 				return moved, nil, fmt.Errorf("finding merge base for %s: %w", name, err)
 			}
@@ -297,7 +299,7 @@ func rebaseRemaining(cfg *config.Config, dir string, state *StateFile, s *stack.
 		}
 		state.RemainingBranches = append([]string{}, branches[i+1:]...)
 		state.AffectsPRs = state.AffectsPRs || branch.PullRequest != nil
-		if conflict, err := rebaseInOwner(dir, state, s, sf, name, newBase, oldBase); err != nil {
+		if conflict, err := rebaseInOwner(dir, state, s, sf, name, target, oldBase); err != nil {
 			return moved, conflict, err
 		}
 		state.ConflictBranch, state.ConflictType = "", "cascade"
@@ -653,6 +655,7 @@ func ContinueApply(
 
 	// Update base SHAs
 	updateBaseSHAs(s)
+	recordPinnedBase(state, s)
 
 	// Transition to pending_submit only when PRs are affected
 	needsSubmit := s.ID != "" && state.AffectsPRs

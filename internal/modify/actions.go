@@ -164,7 +164,7 @@ func applyInsert(cfg *config.Config, dir string, state *StateFile, s *stack.Stac
 	if err := checkExpectedRef(state, action.Target); err != nil {
 		return err
 	}
-	parentSHA, err := ops.RevParse(action.Target)
+	parentSHA, err := ops.RevParse(baseRef(state, action.Target))
 	if err != nil {
 		return fmt.Errorf("resolving insert parent %s: %w", action.Target, err)
 	}

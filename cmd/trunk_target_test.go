@@ -3,8 +3,6 @@ package cmd
 import (
 	"errors"
 	"io"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/github/gh-stack/internal/config"
@@ -258,8 +256,7 @@ func TestRebase_StartErrorDoesNotWriteRecoveryState(t *testing.T) {
 	err := cmd.Execute()
 
 	assert.ErrorIs(t, err, ErrSilent)
-	_, statErr := os.Stat(filepath.Join(tmpDir, rebaseStateFile))
-	assert.True(t, os.IsNotExist(statErr))
+	assertNoJournal(t, tmpDir, rebaseStateFile)
 }
 
 func TestRebase_LaterStartErrorRestoresEarlierBranches(t *testing.T) {
@@ -480,8 +477,7 @@ func TestRebase_ContinueVerificationFailureRestoresAndClearsState(t *testing.T) 
 	assert.ErrorIs(t, err, ErrSilent)
 	assert.Equal(t, "old-b2", branchSHAs["b2"])
 	assert.Equal(t, "old-b3", branchSHAs["b3"])
-	_, statErr := os.Stat(filepath.Join(tmpDir, rebaseStateFile))
-	assert.True(t, os.IsNotExist(statErr), "terminal verification failure must clear stale continuation state")
+	assertNoJournal(t, tmpDir, rebaseStateFile)
 }
 
 func TestSync_UnstackedCascadeDoesNotPush(t *testing.T) {

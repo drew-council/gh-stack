@@ -59,7 +59,11 @@ func stackStateDir(cfg *config.Config) (string, error) {
 	return commonDir, nil
 }
 
-// Nested command calls share the outer command's lock and catalog selection.
+// beginStackMutation starts a mutating command. The operation lock is held
+// only to inspect recovery state and to record the command's claim: the
+// command then runs under that claim, so commands on other stacks and
+// worktrees are free to run beside it. Nested command calls share the outer
+// command's claim and catalog selection.
 func beginStackMutation(cfg *config.Config, kind string) (func(), error) {
 	if cfg.StackMutation != nil {
 		return func() {}, nil
@@ -72,24 +76,40 @@ func beginStackMutation(cfg *config.Config, kind string) (func(), error) {
 	if err != nil {
 		return nil, stackStateError(cfg, "acquiring stack operation lock", err)
 	}
-	stateDir, err := mutationStateDir(cfg, commonDir, kind)
+	stateDir, unclaimedJournal, err := mutationStateDir(cfg, commonDir, kind)
 	if err != nil {
 		lock.Unlock()
 		return nil, err
 	}
-	cfg.StackMutation = &config.StackMutationContext{CommonDir: commonDir, StateDir: stateDir}
+	m := &config.StackMutationContext{CommonDir: commonDir, StateDir: stateDir, Kind: kind, UnclaimedJournal: unclaimedJournal}
 	switch kind {
 	case "rebase", "rebase-continue", "rebase-abort", "sync", "modify", "modify-continue", "modify-abort":
-		cfg.StackMutation.NoCheckoutOnSelect = true
+		m.NoCheckoutOnSelect = true
 	}
+	// Recovery of state that predates claims has no claim to exclude a
+	// second recovery of the same state, so it keeps the operation lock, as
+	// every command once did.
+	exclusive := !claimsApply(m)
+	if !exclusive {
+		lock.Unlock()
+	}
+	cfg.StackMutation = m
 	released := false
-	return func() {
+	release := func() {
 		if !released {
 			released = true
 			cfg.StackMutation = nil
-			lock.Unlock()
+			endMutation(m)
+			if exclusive {
+				lock.Unlock()
+			}
 		}
-	}, nil
+	}
+	if err := startMutation(cfg, m); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
 }
 
 func stackStateError(cfg *config.Config, action string, err error) error {
@@ -128,6 +148,8 @@ type stackJournal struct {
 	legacy bool
 }
 
+// readStackJournals reads the journals that predate operation records: those
+// beside the shared catalog and those in worktree Git directories.
 func readStackJournals(cfg *config.Config, commonDir, localDir string) ([]stackJournal, error) {
 	dirs := []string{commonDir}
 	if !worktree.SamePath(commonDir, localDir) {
@@ -144,6 +166,18 @@ func readStackJournals(cfg *config.Config, commonDir, localDir string) ([]stackJ
 			dirs = append(dirs, dir)
 		}
 	}
+	journals, err := readJournals(cfg, dirs)
+	if err != nil {
+		return nil, err
+	}
+	for i := range journals {
+		// Upgrading a legacy journal does not move its private catalog.
+		journals[i].legacy = journals[i].legacy || !worktree.SamePath(journals[i].dir, commonDir)
+	}
+	return journals, nil
+}
+
+func readJournals(cfg *config.Config, dirs []string) ([]stackJournal, error) {
 	var journals []stackJournal
 	for _, dir := range dirs {
 		for _, kind := range []string{"rebase", "modify"} {
@@ -199,27 +233,29 @@ func readStackJournals(cfg *config.Config, commonDir, localDir string) ([]stackJ
 				cfg.Errorf("reading recovery state %s: %s", path, err)
 				return nil, exitErr
 			}
-			// Upgrading a legacy journal does not move its private catalog.
-			journal.legacy = journal.legacy || !worktree.SamePath(dir, commonDir)
 			journals = append(journals, journal)
 		}
 	}
 	return journals, nil
 }
 
-func mutationStateDir(cfg *config.Config, commonDir, kind string) (string, error) {
+// mutationStateDir selects the catalog directory for a command and handles
+// recovery state that predates operation records. Such a journal carries no
+// claim, so it blocks every mutation but its own recovery. The second result
+// reports that the command's journal sits beside its catalog.
+func mutationStateDir(cfg *config.Config, commonDir, kind string) (string, bool, error) {
 	localDir, err := git.GitDir()
 	if err != nil {
 		cfg.Errorf("finding worktree Git directory: %s", err)
-		return "", ErrNotInStack
+		return "", false, ErrNotInStack
 	}
 	if !filepath.IsAbs(localDir) {
 		cfg.Errorf("could not determine an absolute worktree Git directory: %q", localDir)
-		return "", ErrSilent
+		return "", false, ErrSilent
 	}
 	journals, err := readStackJournals(cfg, commonDir, localDir)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	legacyRecovery := false
 	for _, journal := range journals {
@@ -228,6 +264,7 @@ func mutationStateDir(cfg *config.Config, commonDir, kind string) (string, error
 		}
 	}
 	recoveryDir := ""
+	awaitsSubmit := false
 	for _, journal := range journals {
 		// Independent old-version sessions must be recovered one at a time,
 		// each against its own catalog, never against a merged stack index.
@@ -235,6 +272,7 @@ func mutationStateDir(cfg *config.Config, commonDir, kind string) (string, error
 			continue
 		}
 		if journal.kind == "modify" && journal.phase == modify.PhasePendingSubmit {
+			awaitsSubmit = awaitsSubmit || worktree.SamePath(journal.dir, commonDir)
 			continue
 		}
 		if journalAllowsRecovery(journal, kind) &&
@@ -242,39 +280,36 @@ func mutationStateDir(cfg *config.Config, commonDir, kind string) (string, error
 			if recoveryDir != "" && !worktree.SamePath(recoveryDir, journal.dir) {
 				cfg.Errorf("multiple %s recovery journals found in %s and %s; preserve both catalogs and resolve the conflicting sessions before continuing", journal.kind, recoveryDir, journal.dir)
 				if journal.kind == "rebase" {
-					return "", ErrRebaseActive
+					return "", false, ErrRebaseActive
 				}
-				return "", ErrModifyRecovery
+				return "", false, ErrModifyRecovery
 			}
 			recoveryDir = journal.dir
 			continue
 		}
-		if journal.legacy {
-			cfg.Errorf("a legacy %s session needs recovery in its original worktree (Git directory %s)", journal.kind, journal.dir)
-		} else {
-			cfg.Errorf("a %s operation is already in progress (%s)", journal.kind, journal.path)
-			if journal.origin != "" {
-				cfg.Printf("Operation started in worktree %s", journal.origin)
-			}
+		if !journal.legacy {
+			return "", false, reportActiveJournal(cfg, journal)
 		}
+		cfg.Errorf("a legacy %s session needs recovery in its original worktree (Git directory %s)", journal.kind, journal.dir)
 		cfg.Printf("Run `gh stack %s --continue` or `gh stack %s --abort` before another mutation", journal.kind, journal.kind)
 		if journal.kind == "rebase" {
-			return "", ErrRebaseActive
+			return "", false, ErrRebaseActive
 		}
-		return "", ErrModifyRecovery
+		return "", false, ErrModifyRecovery
 	}
 	if legacyRecovery {
-		return localDir, nil
+		return localDir, true, nil
 	}
 	if recoveryDir != "" {
 		// Recovery stays with its saved catalog, even if a legacy main-worktree
 		// journal gained a Context while other private catalogs still exist.
-		return recoveryDir, nil
+		return recoveryDir, true, nil
 	}
 	if err := stack.MigrateLegacyState(commonDir); err != nil {
-		return "", stackStateError(cfg, "migrating stack state", err)
+		return "", false, stackStateError(cfg, "migrating stack state", err)
 	}
-	return commonDir, nil
+	// A new modify must still find a completed one that awaits submit there.
+	return commonDir, awaitsSubmit && kind == "modify", nil
 }
 
 func journalAllowsRecovery(journal stackJournal, kind string) bool {
@@ -448,6 +483,10 @@ func checkoutWorktreeBranch(cfg *config.Config, target string, printPath bool) e
 			return err
 		}
 		defer release()
+		// An operation on the target's stack expects to find it where it is.
+		if err := claim(cfg, []string{target}, nil); err != nil {
+			return err
+		}
 		// A separate process may have checked out the target while we waited.
 		owner, err = foreignWorktreePath(target)
 		if err != nil {
@@ -476,7 +515,7 @@ func checkoutWorktreeBranch(cfg *config.Config, target string, printPath bool) e
 			cfg.Errorf("a Git operation is in progress in the current worktree; complete or abort it before switching branches")
 			return ErrRebaseActive
 		}
-		if err := git.CheckoutBranch(target); err != nil {
+		if err := worktree.CheckoutUnclaimed(git.CurrentOps(), target); err != nil {
 			return err
 		}
 	}

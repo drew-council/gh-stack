@@ -13,6 +13,12 @@ func tryLockFile(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 }
 
+// tryLockFileShared attempts a non-blocking shared lock. Shared holders
+// exclude exclusive ones, not each other.
+func tryLockFileShared(f *os.File) error {
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+}
+
 // isLockBusy reports whether err indicates the lock is held by another process.
 func isLockBusy(err error) bool {
 	return err == syscall.EWOULDBLOCK

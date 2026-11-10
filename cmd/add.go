@@ -171,6 +171,10 @@ func runAdd(cfg *config.Config, opts *addOptions, args []string) error {
 		cfg.Errorf("branch %q already exists in the stack", branchName)
 		return ErrInvalidArgs
 	}
+	// The new branch joins the stack, and so its claim.
+	if err := claim(cfg, []string{branchName}, nil); err != nil {
+		return err
+	}
 
 	// If the branch already exists in git but is not part of any stack,
 	// adopt it instead of erroring. This mirrors the init command's behavior.

@@ -77,6 +77,9 @@ func runPush(cfg *config.Config, opts *pushOptions) error {
 		return ErrDisambiguate
 	}
 	s := stacks[0]
+	if sf, s, err = claimStack(cfg, gitDir, sf, s); err != nil {
+		return stackLookupError(err)
+	}
 
 	// Push all active branches with explicit per-branch leases.
 	remote, err := pickRemote(cfg, currentBranch, opts.remote)

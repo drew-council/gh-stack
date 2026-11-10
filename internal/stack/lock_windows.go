@@ -23,6 +23,17 @@ func tryLockFile(f *os.File) error {
 	)
 }
 
+// tryLockFileShared attempts a non-blocking shared lock. Shared holders
+// exclude exclusive ones, not each other.
+func tryLockFileShared(f *os.File) error {
+	ol := new(windows.Overlapped)
+	return windows.LockFileEx(
+		windows.Handle(f.Fd()),
+		windows.LOCKFILE_FAIL_IMMEDIATELY,
+		0, 1, 0, ol,
+	)
+}
+
 // isLockBusy reports whether err indicates the lock is held by another process.
 func isLockBusy(err error) bool {
 	return errors.Is(err, windows.ERROR_LOCK_VIOLATION)

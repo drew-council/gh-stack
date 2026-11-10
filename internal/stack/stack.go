@@ -232,10 +232,19 @@ type StackFile struct {
 	Repository    string  `json:"repository"`
 	Stacks        []Stack `json:"stacks"`
 
-	// loadChecksum is the SHA-256 of the raw file bytes at Load time.
-	// Save uses it to detect concurrent modifications (optimistic concurrency).
-	// nil means the file did not exist when loaded.
+	// loadChecksum is the SHA-256 of the raw file bytes this view last read
+	// or wrote. nil means the file did not exist when loaded.
 	loadChecksum []byte
+
+	// synced holds each stack as this view last read or wrote it. Save
+	// publishes only the difference from it, so stacks that other processes
+	// changed in the meantime survive.
+	synced           []string
+	syncedRepository string
+
+	// diverged records that Save merged this view into a catalog holding
+	// stacks the view does not have. Such a view MUST NOT be written verbatim.
+	diverged bool
 }
 
 // FindAllStacksForBranch returns all stacks that contain the given branch.
@@ -345,27 +354,224 @@ func parseStackFile(data []byte) (*StackFile, error) {
 
 	sum := sha256.Sum256(data)
 	sf.loadChecksum = sum[:]
+	if err := sf.markSynced(); err != nil {
+		return nil, err
+	}
 	return &sf, nil
 }
 
-// Save acquires an exclusive lock on the stack file, verifies the file hasn't
-// been modified since Load (optimistic concurrency), writes sf as JSON, and
-// releases the lock.  The lock is held only for the read-compare-write window.
-// Mutation callers must separately hold the operation lock across their
-// Load/preflight/Save sequence; read-only refreshes should use SaveNonBlocking.
+func encodeStacks(stacks []Stack) ([]string, error) {
+	encoded := make([]string, len(stacks))
+	for i := range stacks {
+		data, err := json.Marshal(&stacks[i])
+		if err != nil {
+			return nil, fmt.Errorf("marshaling stack: %w", err)
+		}
+		encoded[i] = string(data)
+	}
+	return encoded, nil
+}
+
+func (sf *StackFile) markSynced() error {
+	synced, err := encodeStacks(sf.Stacks)
+	if err != nil {
+		return err
+	}
+	sf.synced, sf.syncedRepository = synced, sf.Repository
+	return nil
+}
+
+// pendingChanges splits this view against its last synced state: the indexes
+// of stacks it added or changed, and the synced form of stacks it changed or
+// removed. Stacks are compared as whole values.
+func (sf *StackFile) pendingChanges() (changed []int, removed []string, err error) {
+	mine, err := encodeStacks(sf.Stacks)
+	if err != nil {
+		return nil, nil, err
+	}
+	unmatched := make(map[string]int, len(sf.synced))
+	for _, stack := range sf.synced {
+		unmatched[stack]++
+	}
+	for i, stack := range mine {
+		if unmatched[stack] > 0 {
+			unmatched[stack]--
+		} else {
+			changed = append(changed, i)
+		}
+	}
+	for _, stack := range sf.synced {
+		if unmatched[stack] > 0 {
+			unmatched[stack]--
+			removed = append(removed, stack)
+		}
+	}
+	return changed, removed, nil
+}
+
+// changedBranches names every branch of a stack this view added, changed, or
+// removed since it was last synced.
+func (sf *StackFile) changedBranches() ([]string, error) {
+	changed, removed, err := sf.pendingChanges()
+	if err != nil {
+		return nil, err
+	}
+	var branches []string
+	for _, i := range changed {
+		branches = append(branches, sf.Stacks[i].BranchNames()...)
+	}
+	for _, encoded := range removed {
+		var before Stack
+		if err := json.Unmarshal([]byte(encoded), &before); err != nil {
+			return nil, err
+		}
+		branches = append(branches, before.BranchNames()...)
+	}
+	return branches, nil
+}
+
+// mergeInto applies this view's pending changes to the stacks on disk. A
+// changed stack takes the place of the stack it shares a branch with; any
+// other new stack is appended. It fails when another process changed or
+// removed a stack this view also changed, or when the result would put one
+// branch in two stacks.
+func (sf *StackFile) mergeInto(disk []Stack) ([]Stack, error) {
+	changed, removed, err := sf.pendingChanges()
+	if err != nil {
+		return nil, err
+	}
+	current, err := encodeStacks(disk)
+	if err != nil {
+		return nil, err
+	}
+	// replaced[i] marks disk stack i as superseded by this view.
+	replaced := make(map[int]struct{}, len(removed))
+	for _, before := range removed {
+		index := -1
+		for i, stack := range current {
+			if _, taken := replaced[i]; !taken && stack == before {
+				index = i
+				break
+			}
+		}
+		if index < 0 {
+			var lost Stack
+			_ = json.Unmarshal([]byte(before), &lost)
+			return nil, fmt.Errorf("stack %s was changed by another process", lost.DisplayChain())
+		}
+		replaced[index] = struct{}{}
+	}
+
+	successor := make(map[int]int, len(changed))
+	var appended []int
+	for _, mine := range changed {
+		slot := -1
+		for i := range disk {
+			_, superseded := replaced[i]
+			_, filled := successor[i]
+			if superseded && !filled && sharesBranch(&disk[i], &sf.Stacks[mine]) {
+				slot = i
+				break
+			}
+		}
+		if slot < 0 {
+			appended = append(appended, mine)
+		} else {
+			successor[slot] = mine
+		}
+	}
+
+	merged := make([]Stack, 0, len(disk)+len(appended))
+	fromView := make(map[int]struct{}, len(changed))
+	for i := range disk {
+		if mine, ok := successor[i]; ok {
+			fromView[len(merged)] = struct{}{}
+			merged = append(merged, sf.Stacks[mine])
+		} else if _, superseded := replaced[i]; !superseded {
+			merged = append(merged, disk[i])
+		}
+	}
+	for _, mine := range appended {
+		fromView[len(merged)] = struct{}{}
+		merged = append(merged, sf.Stacks[mine])
+	}
+
+	for i := range fromView {
+		for _, branch := range merged[i].Branches {
+			for j := range merged {
+				if i != j && merged[j].IndexOf(branch.Branch) >= 0 {
+					return nil, fmt.Errorf("branch %q was added to stack %s by another process", branch.Branch, merged[j].DisplayChain())
+				}
+			}
+		}
+	}
+	return merged, nil
+}
+
+func sharesBranch(a, b *Stack) bool {
+	for _, branch := range a.Branches {
+		if b.IndexOf(branch.Branch) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// Save acquires an exclusive lock on the stack file, publishes the stacks sf
+// added, changed, or removed since it was loaded, and releases the lock. The
+// lock is held only for the read-merge-write window.
+//
+// Stacks that sf left untouched are written as they are on disk, so commands
+// working on different stacks do not overwrite each other. A command that
+// changes an existing stack MUST hold a claim on it from before it loaded the
+// catalog; read-only refreshes should use SaveNonBlocking.
 // Returns *LockError if the lock times out, or *StaleError if another process
-// modified the file since it was loaded.
+// changed a stack that sf also changed.
 func Save(gitDir string, sf *StackFile) error {
 	lock, err := Lock(gitDir)
 	if err != nil {
 		return err // *LockError for contention, plain error for I/O failures
 	}
 	defer lock.Unlock()
+	return saveLocked(gitDir, sf)
+}
 
-	if err := checkStale(gitDir, sf); err != nil {
+// saveLocked publishes sf's pending changes. The caller must hold the catalog
+// lock.
+func saveLocked(gitDir string, sf *StackFile) error {
+	data, err := readStateFile(stackFilePath(gitDir))
+	if errors.Is(err, os.ErrNotExist) {
+		// A catalog that vanished is recreated: this is not a lost update.
+		return writeStackFile(gitDir, sf)
+	}
+	if err != nil {
+		return fmt.Errorf("reading stack file for staleness check: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	if !sf.diverged && sf.loadChecksum != nil && bytes.Equal(sf.loadChecksum, sum[:]) {
+		return writeStackFile(gitDir, sf)
+	}
+
+	disk, err := parseStackFile(data)
+	if err != nil {
 		return err
 	}
-	return writeStackFile(gitDir, sf)
+	stacks, err := sf.mergeInto(disk.Stacks)
+	if err != nil {
+		return &StaleError{Err: fmt.Errorf("stack file was modified by another process since it was loaded: %w", err)}
+	}
+	merged := &StackFile{Repository: disk.Repository, Stacks: stacks}
+	if sf.Repository != sf.syncedRepository {
+		merged.Repository = sf.Repository
+	}
+	if err := writeStackFile(gitDir, merged); err != nil {
+		return err
+	}
+	// The view keeps its own stacks, so pointers into them stay valid. It no
+	// longer mirrors the file.
+	sf.loadChecksum = merged.loadChecksum
+	sf.diverged = true
+	return sf.markSynced()
 }
 
 // SaveWithLock writes the stack file while the caller already holds the catalog
@@ -380,9 +586,10 @@ func SaveWithLock(gitDir string, sf *StackFile, lock *FileLock) error {
 }
 
 // SaveNonBlocking attempts a best-effort metadata refresh without waiting for
-// either the operation or catalog lock. Contention, stale data and I/O errors
-// skip the refresh. Use Save for critical writes, including callers already
-// holding the operation lock.
+// either the operation or catalog lock. Contention, stale data, I/O errors,
+// and a change to a stack that another operation claims all skip the refresh.
+// It is the only way to write a stack without holding a claim on it. Use Save
+// for critical writes.
 func SaveNonBlocking(gitDir string, sf *StackFile) {
 	operation, acquired, err := TryLockOperation(gitDir)
 	if err != nil || !acquired {
@@ -400,45 +607,16 @@ func SaveNonBlocking(gitDir string, sf *StackFile) {
 	if _, err := os.Lstat(filepath.Join(gitDir, migrationFileName)); !errors.Is(err, os.ErrNotExist) {
 		return
 	}
-	if checkStale(gitDir, sf) != nil {
+	// An operation claims its stacks before it loads them and saves them
+	// when it ends. Writing one in between would invalidate that save.
+	branches, err := sf.changedBranches()
+	if err != nil {
 		return
 	}
-	_ = writeStackFile(gitDir, sf)
-}
-
-// checkStale compares the current on-disk content against the checksum
-// captured at Load time.  Returns *StaleError if the file was modified
-// by another process.  The caller must hold the lock.
-func checkStale(gitDir string, sf *StackFile) error {
-	path := stackFilePath(gitDir)
-	data, err := readStateFile(path)
-
-	if errors.Is(err, os.ErrNotExist) {
-		// File absent on disk.
-		if sf.loadChecksum == nil {
-			return nil // was absent at Load time too — no conflict
-		}
-		// File existed at Load but is now gone.  Allow the write to
-		// recreate it rather than erroring; this is not a lost-update.
-		return nil
+	if claimed, err := claimedByOthers(gitDir, branches); err != nil || claimed {
+		return
 	}
-	if err != nil {
-		return fmt.Errorf("reading stack file for staleness check: %w", err)
-	}
-
-	// File exists on disk.
-	if sf.loadChecksum == nil {
-		// File was absent at Load but another process created it.
-		return &StaleError{Err: fmt.Errorf(
-			"stack file was created by another process since it was loaded")}
-	}
-
-	sum := sha256.Sum256(data)
-	if !bytes.Equal(sf.loadChecksum, sum[:]) {
-		return &StaleError{Err: fmt.Errorf(
-			"stack file was modified by another process since it was loaded")}
-	}
-	return nil
+	_ = saveLocked(gitDir, sf)
 }
 
 func writeStackFile(gitDir string, sf *StackFile) error {
@@ -449,11 +627,11 @@ func writeStackFile(gitDir string, sf *StackFile) error {
 	if err := WriteAtomic(stackFilePath(gitDir), data); err != nil {
 		return fmt.Errorf("writing stack file: %w", err)
 	}
-	// Refresh checksum so a second Save on the same StackFile doesn't
-	// spuriously fail the staleness check.
+	// Refresh the synced state so a second Save on the same StackFile
+	// publishes only what changed after this one.
 	sum := sha256.Sum256(data)
 	sf.loadChecksum = sum[:]
-	return nil
+	return sf.markSynced()
 }
 
 func marshalStackFile(sf *StackFile) ([]byte, error) {
