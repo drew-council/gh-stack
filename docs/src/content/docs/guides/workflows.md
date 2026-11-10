@@ -11,7 +11,7 @@ With Git 2.36+, you can keep separate stacks in linked worktrees or check out di
 
 ### Shared catalog and migration
 
-The catalog is `<common-dir>/gh-stack`, where the common directory is reported by `git rev-parse --path-format=absolute --git-common-dir`. In an ordinary clone this is `.git/gh-stack`. gh-stack's rebase and modify recovery journals also live there. Git's HEAD, index, rebase, and cherry-pick markers remain local to each worktree.
+The catalog is `<common-dir>/gh-stack`, where the common directory is reported by `git rev-parse --path-format=absolute --git-common-dir`. In an ordinary clone this is `.git/gh-stack`. Each running or paused operation keeps its claim and recovery journal under `<common-dir>/gh-stack-operations/`. Git's HEAD, index, rebase, and cherry-pick markers remain local to each worktree.
 
 On upgrade, gh-stack automatically consolidates nonconflicting legacy catalogs, coalesces equivalent definitions, and preserves originals as backups. Sharing a trunk is fine; conflicting branch membership or stack definitions stop migration and identify the source files. Reconcile the conflicting definitions rather than deleting whichever file looks older. Finish or abort legacy operations in their original worktree before migration, and do not run old and new gh-stack versions against the same clone.
 
@@ -69,13 +69,21 @@ gh-stack does not install shell functions or change your shell's directory. Do n
 
 When a trunk belongs to multiple stacks, selecting one for `rebase`, `sync`, or `modify` does not switch branches. Rebase ranges use the caller's original checkout unless an explicit branch is supplied.
 
-Resolve and stage conflicts in the worktree named by the diagnostic. You can run `gh stack rebase --continue` or `--abort` from any linked worktree: the shared journal routes recovery to the recorded owners. `sync` still restores its cascade on conflicts rather than pushing partial results; completed fetches and earlier fast-forwards are outside that rollback boundary. Recovery retains state and reports any partial failure rather than discarding later edits or claiming a full restoration. Pruning skips branches still occupied in other worktrees.
+Resolve and stage conflicts in the worktree named by the diagnostic. You can run `gh stack rebase --continue` or `--abort` from any linked worktree: the operation's journal routes recovery to the recorded owners. When several operations are paused, run it from a worktree of the one to recover, or with one of its branches checked out. `sync` still restores its cascade on conflicts rather than pushing partial results; completed fetches and earlier fast-forwards are outside that rollback boundary. Recovery retains state and reports any partial failure rather than discarding later edits or claiming a full restoration. Pruning skips branches still occupied in other worktrees.
 
 Finish paused operations before changing gh-stack versions or preview stages. Origin-only journals are explicitly marked; a build that cannot interpret a journal's execution lifecycle must leave it intact. If recovery reports an incompatible lifecycle, use the matching build in the recorded origin to finish or abort it instead of editing or removing the journal.
 
 Legacy recovery remains in its original worktree. Interrupted application or restoration must be aborted; a completed operation retries only its original checkout and catalog publication. Failed restoration, checkout, or publication retains the journal for recovery rather than replaying completed work.
 
-gh-stack serializes mutations across the clone, including independent stacks. Read-only views remain available. A paused rebase or modify journal blocks new gh-stack mutations until recovery. These locks coordinate **gh-stack only**, not arbitrary Git commands, editors, or other tools. Keep affected worktrees quiescent while history is being rewritten. During a pause, make only the requested conflict-resolution edits and staging in the reported worktree; avoid unrelated commits or checkout changes on participating branches.
+### Concurrent operations
+
+Commands on independent stacks run at the same time, each from its own worktree. A command claims the stack it works on and the worktrees it uses: the one it starts in and, for `rebase`, `sync`, and `modify`, those that hold the stack's branches. Claims never overlap. A command whose claim overlaps a running one waits for 5 seconds and then exits with code 8, naming the command in its way. Read-only views remain available.
+
+A paused rebase or modify keeps its claim. Its own stack and worktrees refuse new mutations until `--continue` or `--abort`; every other stack keeps working. A command that dies without pausing leaves nothing to recover, so its claim ends with it.
+
+Stacks share their trunk. One command fast-forwards the local trunk and the others find it up to date. A command that finds the trunk's worktree in use by another operation rebases onto the fetched remote trunk and leaves the local one alone. A stack built on a branch of another stack shares that stack's claim, so the two never rewrite at once.
+
+Claims coordinate **gh-stack only**, not arbitrary Git commands, editors, or other tools. Keep affected worktrees quiescent while history is being rewritten. During a pause, make only the requested conflict-resolution edits and staging in the reported worktree; avoid unrelated commits or checkout changes on participating branches.
 
 **Distributed modify:** `modify` supports renaming, inserting, dropping, folding, and reordering branches across worktrees. It preflights affected owners, runs each rename/rewrite in the appropriate worktree, and uses the origin for unoccupied branches. Other worktrees keep their branch choices; dropping/folding a layer preserves its branch and worktree. If the nearest surviving branch is owned elsewhere, the origin keeps its preserved branch and reports the survivor's path. Conflicts are resolved in the reported owner, while `--continue` and `--abort` can be invoked from any linked worktree. See [Restructuring stacks](/gh-stack/guides/modify/).
 

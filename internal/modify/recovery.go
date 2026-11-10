@@ -218,10 +218,39 @@ func expectedHead(state *StateFile, branch string) string {
 			return original.TipSHA
 		}
 	}
-	if branch == state.StackName {
+	return ""
+}
+
+// baseRef returns the ref to rebase onto, or to branch from, for a parent
+// named name. The trunk is pinned to the commit it had when the modify
+// started: it is only read, and commands on other stacks may fast-forward it
+// while this one runs or is paused.
+func baseRef(state *StateFile, name string) string {
+	if name == state.StackName && state.TrunkSHA != "" {
 		return state.TrunkSHA
 	}
-	return ""
+	return name
+}
+
+// recordPinnedBase corrects the recorded base of the branches that sit on the
+// trunk when the trunk moved during the modify. They were rebased onto the
+// pinned commit, not onto the trunk's new tip.
+func recordPinnedBase(state *StateFile, s *stack.Stack) {
+	if state.TrunkSHA == "" {
+		return
+	}
+	if current, err := git.RevParse(s.Trunk.Branch); err != nil || current == state.TrunkSHA {
+		return
+	}
+	for i := range s.Branches {
+		branch := &s.Branches[i]
+		if branch.IsMerged() || s.ActiveBaseBranch(branch.Branch) != s.Trunk.Branch {
+			continue
+		}
+		if contains, err := git.IsAncestor(state.TrunkSHA, branch.Branch); err == nil && contains {
+			branch.Base = state.TrunkSHA
+		}
+	}
 }
 
 func checkExpectedRef(state *StateFile, branch string) error {
@@ -800,7 +829,7 @@ func restoreLegacy(ops git.Ops, state *StateFile, originalBranch string, existin
 		}
 	}
 	if originalBranch != "" {
-		if err := ops.CheckoutBranch(originalBranch); err != nil {
+		if err := worktree.CheckoutUnclaimed(ops, originalBranch); err != nil {
 			return fmt.Errorf("restoring original checkout %s: %w", originalBranch, err)
 		}
 	}

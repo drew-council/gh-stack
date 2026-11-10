@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/github/gh-stack/internal/git"
+	"github.com/github/gh-stack/internal/stack"
 )
 
 // Location records a worktree's stable administration-directory identity.
@@ -52,6 +54,26 @@ func New() (*Context, error) {
 		ctx.Owners[tree.Branch] = &Location{Path: tree.Path}
 	}
 	return ctx, nil
+}
+
+// TrunkWait bounds how long a checkout waits for a fast-forward of its branch
+// in another process.
+var TrunkWait = 2 * time.Minute
+
+// CheckoutUnclaimed checks out a branch that no operation claims, such as a
+// trunk. Another process may fast-forward such a branch by moving its ref,
+// which is only safe while no checkout of it is under way.
+func CheckoutUnclaimed(ops git.Ops, branch string) error {
+	if common, err := git.CommonDir(); err == nil {
+		lock, err := stack.LockTrunkShared(common, TrunkWait)
+		var busy *stack.LockError
+		if errors.As(err, &busy) {
+			return fmt.Errorf("checking out %s: %w", branch, err)
+		}
+		// Without a usable lock file there is no clone to coordinate with.
+		defer lock.Unlock()
+	}
+	return ops.CheckoutBranch(branch)
 }
 
 func SamePath(a, b string) bool {
@@ -371,7 +393,7 @@ func (c *Context) RestoreOrigin(branch string) error {
 	if err := CheckClean(ops, c.Origin.Path); err != nil {
 		return err
 	}
-	if err := ops.CheckoutBranch(branch); err != nil {
+	if err := CheckoutUnclaimed(ops, branch); err != nil {
 		return fmt.Errorf("restoring checkout %s in %s: %w", branch, c.Origin.Path, err)
 	}
 	return nil

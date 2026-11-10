@@ -162,10 +162,13 @@ Existing backlinks are read without adding a private registry or changing Git co
 
 ## Stack file is locked (exit 8)
 
-Another `gh stack` process holds either the short catalog lock (`<common-dir>/gh-stack.lock`) or
-the clone-wide mutation lock (`<common-dir>/gh-stack-operation.lock`). Wait and retry; read-only
-views remain available. Do not delete lock files to bypass coordination. Paused operations are
-also guarded by shared recovery journals after their process lock has been released.
+Another `gh stack` process is working on the same stack or in the same worktree. The message names
+that command and its worktree. Less often, a process holds a short lock: the catalog lock
+(`<common-dir>/gh-stack.lock`) or the lock on the operation records
+(`<common-dir>/gh-stack-operation.lock`). Wait and retry. Commands on other stacks and read-only
+views are not affected. Do not delete lock files or anything under
+`<common-dir>/gh-stack-operations/` to bypass coordination: a paused operation keeps its claim and
+recovery journal there until it is continued or aborted (exit 7 or 10 names it).
 
 ## An interrupted modify session (exit 10)
 

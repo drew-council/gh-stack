@@ -444,8 +444,8 @@ func reconcileAndImportRemoteStack(cfg *config.Config, client github.ClientOps, 
 		return nil, "", err
 	}
 	defer release()
-	// The remote lookup or picker may have taken time. Reload after acquiring
-	// the clone-wide lock instead of applying an import to a stale snapshot.
+	// The remote lookup or picker may have taken time. Reload instead of
+	// applying an import to a stale snapshot.
 	fresh, err := stack.Load(gitDir)
 	if err != nil {
 		cfg.Errorf("loading stack state: %s", err)
@@ -459,6 +459,11 @@ func reconcileAndImportRemoteStack(cfg *config.Config, client github.ClientOps, 
 	localStack := findLocalStackForRemotePRs(sf, prs)
 
 	if localStack != nil {
+		claimed, target, err := claimStack(cfg, gitDir, sf, localStack)
+		if err != nil {
+			return nil, "", stackLookupError(err)
+		}
+		*sf, localStack = *claimed, target
 		// Sync remote PR metadata before comparing composition so locally
 		// tracked stacks with incomplete PR refs don't appear to conflict.
 		syncRemotePRState(localStack, prs)

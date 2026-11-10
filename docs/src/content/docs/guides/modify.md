@@ -108,13 +108,15 @@ If you want to discard all changes and restore the stack to its pre-modify state
 gh stack modify --abort
 ```
 
-This also works if `modify` was interrupted (e.g., terminal crash). The shared `<common-dir>/gh-stack-modify-state` journal records the origin, participating owners, original checkout, stack identity, action progress, and expected refs before/after mutations. Native rebase/cherry-pick state remains in the worktree running that Git operation.
+This also works if `modify` was interrupted (e.g., terminal crash). The operation's `gh-stack-modify-state` journal, kept in its record under `<common-dir>/gh-stack-operations/`, records the origin, participating owners, original checkout, stack identity, action progress, and expected refs before/after mutations. Native rebase/cherry-pick state remains in the worktree running that Git operation.
 
 Recovery reverses renames in their owners, restores only operation-touched refs, removes only branch refs proven to have been created by this modify, and restores the origin's original checkout. It never deletes a worktree or resets a preserved drop/fold source just because that source is in the snapshot. If an owner is missing, refs or ownership changed externally, or a restore/save fails, recovery stops and retains its journal instead of reporting success. Address the reported problem and retry `--abort`; do not delete the journal to bypass recovery. After a successful modify has reached pending-submit, `--abort` does not undo it and instead directs you to `submit`.
 
-Clone-wide mutation serialization prevents another gh-stack mutation while modify is applying or paused; read-only views remain available. Pending-submit state is consumed only when submitting its matching stack, never an unrelated stack.
+A modify is planned against the trunk commit it started from. Commands on other stacks may fast-forward the shared trunk while it is applying or paused; it still finishes on that commit, and the next `rebase` or `sync` moves the stack onto the newer trunk.
 
-The mutation lock coordinates gh-stack processes only: arbitrary Git commands, editors, and other tools can still change refs or files. Keep affected worktrees idle during history rewrites. While paused, make only the requested conflict-resolution edits and staging in the reported worktree; do not add unrelated commits to branches that have not yet been processed.
+While modify is applying or paused it claims its stack and the worktrees it uses, so no other gh-stack mutation can touch them. Other stacks are unaffected, and read-only views remain available. Pending-submit state reserves nothing. It is consumed only when submitting its matching stack, never an unrelated stack, and only that stack must be submitted before it is modified again.
+
+Claims coordinate gh-stack processes only: arbitrary Git commands, editors, and other tools can still change refs or files. Keep affected worktrees idle during history rewrites. While paused, make only the requested conflict-resolution edits and staging in the reported worktree; do not add unrelated commits to branches that have not yet been processed.
 
 Legacy journals must be continued or aborted in their original worktree before catalog migration. Nonconflicting legacy catalogs are consolidated with originals preserved; conflicts require reconciliation rather than choosing a definition automatically.
 

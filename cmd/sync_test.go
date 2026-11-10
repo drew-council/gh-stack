@@ -363,7 +363,7 @@ func TestSync_TrunkFastForward_WhenOnTrunk(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Len(t, mergeFFCalls, 1, "should use MergeFF when on trunk")
-	assert.Equal(t, "origin/main", mergeFFCalls[0])
+	assert.Equal(t, "remote-sha", mergeFFCalls[0], "the fetched commit is merged, not whatever the remote ref points at by then")
 	assert.Empty(t, updateBranchRefCalls, "should NOT use UpdateBranchRef when on trunk")
 }
 
@@ -2756,7 +2756,7 @@ func TestSync_Issue512ConflictRestoresLocalSnapshots(t *testing.T) {
 	assert.Equal(t, remoteBefore, issue250Git(t, repo.dir, "rev-parse", "origin/child"))
 	assert.Equal(t, "parent", issue250Git(t, parentDir, "branch", "--show-current"))
 	assert.Equal(t, "child", issue250Git(t, childDir, "branch", "--show-current"))
-	assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+	assertNoJournal(t, repo.gitDir, rebaseStateFile)
 }
 
 func TestSync_SharedTrunkSelectionRestoresOrigin(t *testing.T) {
@@ -2793,8 +2793,7 @@ func TestSync_WorktreesConflictRestoresWithoutPush(t *testing.T) {
 	assert.Equal(t, remoteChild, issue250Git(t, repo.dir, "rev-parse", "origin/child"))
 	assert.False(t, requireGitState(t, requireWorktree(t, git.CurrentOps(), repo.childDir).IsRebaseInProgress))
 	assert.Equal(t, "main", issue250Git(t, repo.dir, "branch", "--show-current"))
-	_, err := os.Stat(filepath.Join(repo.gitDir, rebaseStateFile))
-	assert.ErrorIs(t, err, os.ErrNotExist)
+	assertNoJournal(t, repo.gitDir, rebaseStateFile)
 }
 
 func TestSync_WorktreesPruneKeepsOccupiedMergedBranch(t *testing.T) {
@@ -2846,7 +2845,7 @@ func TestSync_RollbackFailureRetainsRecovery(t *testing.T) {
 	cfg := issue250TestConfig(t)
 
 	require.ErrorIs(t, runSync(cfg, &syncOptions{}), ErrSilent)
-	state, err := loadRebaseState(dir)
+	state, err := loadRebaseState(pausedOperationDir(t, dir))
 	require.NoError(t, err)
 	assert.Equal(t, "restoring", state.Phase)
 	assert.Empty(t, state.ExecutionMode)
@@ -2859,7 +2858,7 @@ func TestSync_RollbackFailureRetainsRecovery(t *testing.T) {
 	require.NoError(t, runRebase(cfg, &rebaseOptions{abort: true}))
 	assert.Equal(t, "old-b1", refs["b1"])
 	assert.Equal(t, "b2", current)
-	assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+	assertNoJournal(t, dir, rebaseStateFile)
 }
 
 func TestSync_BaseRetarget(t *testing.T) {
@@ -2900,7 +2899,7 @@ func TestSync_BaseRetargetConflictKeepsOldBase(t *testing.T) {
 	assert.Equal(t, repo.oldParent, sf.Stacks[0].Branches[0].Base)
 	assert.Equal(t, top, issue250Git(t, repo.dir, "rev-parse", "top"))
 	assert.Equal(t, top, issue250Git(t, repo.dir, "rev-parse", "origin/top"))
-	assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+	assertNoJournal(t, repo.gitDir, rebaseStateFile)
 }
 
 func TestSync_BaseRetargetReviewCases(t *testing.T) {

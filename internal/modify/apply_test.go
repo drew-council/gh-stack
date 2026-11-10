@@ -55,6 +55,10 @@ func newApplyMock(gitDir string, branchSHAs map[string]string) *git.MockOps {
 			if sha, ok := branchSHAs[ref]; ok {
 				return sha, nil
 			}
+			// A commit resolves to itself. The trunk is passed as one.
+			if strings.HasPrefix(ref, "sha-") {
+				return ref, nil
+			}
 			return "sha-" + ref, nil
 		},
 		IsAncestorFn:         func(a, d string) (bool, error) { return false, nil },
@@ -1296,7 +1300,7 @@ func TestApplyPlan_NoChanges(t *testing.T) {
 	mock.IsAncestorFn = func(a, d string) (bool, error) { return true, nil }
 	mock.MergeBaseFn = func(a, b string) (string, error) {
 		// Return the parent tip SHA so the "no rebase needed" check passes
-		if a == "main" && b == "A" {
+		if a == branchSHAs["main"] && b == "A" {
 			return branchSHAs["main"], nil
 		}
 		if a == "A" && b == "B" {
@@ -1936,7 +1940,7 @@ func TestApplyPlan_PendingSubmitForRemoteStack(t *testing.T) {
 	mock := newApplyMock(gitDir, branchSHAs)
 	mock.IsAncestorFn = func(a, d string) (bool, error) { return false, nil }
 	mock.MergeBaseFn = func(a, b string) (string, error) {
-		if a == "main" && b == "A" {
+		if a == branchSHAs["main"] && b == "A" {
 			return branchSHAs["main"], nil
 		}
 		if a == "A" && b == "B" {
@@ -2028,7 +2032,7 @@ func TestApplyPlan_ClearsStateForRemoteStackWithNoPRBranches(t *testing.T) {
 	mock := newApplyMock(gitDir, branchSHAs)
 	mock.IsAncestorFn = func(a, d string) (bool, error) { return true, nil }
 	mock.MergeBaseFn = func(a, b string) (string, error) {
-		if a == "main" && b == "A" {
+		if a == branchSHAs["main"] && b == "A" {
 			return branchSHAs["main"], nil
 		}
 		if a == "A" && b == "B" {
@@ -2078,7 +2082,7 @@ func TestApplyPlan_PendingSubmitOnlyWhenPRBranchesAffected(t *testing.T) {
 	mock := newApplyMock(gitDir, branchSHAs)
 	mock.IsAncestorFn = func(a, d string) (bool, error) { return true, nil }
 	mock.MergeBaseFn = func(a, b string) (string, error) {
-		if a == "main" && b == "A" {
+		if a == branchSHAs["main"] && b == "A" {
 			return branchSHAs["main"], nil
 		}
 		if a == "A" && b == "B" || a == "A" && b == "B-renamed" {
@@ -2981,7 +2985,8 @@ func TestUnwind_PartialFailureRetainsState(t *testing.T) {
 			dir := t.TempDir()
 			origin := t.TempDir()
 			s := stack.Stack{Trunk: stack.BranchRef{Branch: "main"}, Branches: []stack.BranchRef{{Branch: "A"}}}
-			writeTestStackFile(t, dir, s)
+			// The interrupted modify had already rewritten the stack's metadata.
+			writeTestStackFile(t, dir, stack.Stack{Trunk: s.Trunk, Branches: []stack.BranchRef{{Branch: "A", Base: "rewritten"}}})
 			metadata, err := json.Marshal(s)
 			require.NoError(t, err)
 			state := &StateFile{
@@ -3012,6 +3017,8 @@ func TestUnwind_PartialFailureRetainsState(t *testing.T) {
 					sha = value
 					external, err := stack.Load(dir)
 					require.NoError(t, err)
+					// A writer that ignores the claim changes the stack under recovery.
+					external.Stacks[0].Number = 7
 					external.Stacks = append(external.Stacks, stack.Stack{
 						Trunk: s.Trunk, Branches: []stack.BranchRef{{Branch: "other"}},
 					})
@@ -3282,9 +3289,12 @@ func TestModifyRecovery_PreservesExternalCommitAfterSaveFailure(t *testing.T) {
 	nodes := makeNodes(&sf.Stacks[0])
 	nodes[0].PendingAction = &modifyview.PendingAction{Type: modifyview.ActionDrop}
 	nodes[0].Removed = true
-	_, _, err := ApplyPlan(cfg, common, &sf.Stacks[0], sf, nodes, "B", func(*stack.Stack) {
+	_, _, err := ApplyPlan(cfg, common, &sf.Stacks[0], sf, nodes, "B", func(modified *stack.Stack) {
+		modified.Branches[0].Base = "refreshed"
 		external, loadErr := stack.Load(common)
 		require.NoError(t, loadErr)
+		// A writer that ignores the claim changes the stack being modified.
+		external.Stacks[0].Number = 7
 		external.Stacks = append(external.Stacks, stack.Stack{
 			Trunk: stack.BranchRef{Branch: "main"}, Branches: []stack.BranchRef{{Branch: "observer"}},
 		})
@@ -3720,6 +3730,49 @@ func TestDistributedModify_DropLeavesDirtySourceUntouched(t *testing.T) {
 	assert.Equal(t, "B", runModifyGit(t, repo.owners["B"], "branch", "--show-current"))
 }
 
+// Commands on other stacks fast-forward the shared trunk while a modify runs
+// or is paused. The modify stays on the trunk commit it started from.
+func TestDistributedModify_SurvivesTrunkFastForward(t *testing.T) {
+	repo := setupDistributedModify(t, true)
+	originOps := requireWorktree(t, git.CurrentOps(), repo.origin)
+	restore := git.SetOps(originOps)
+	defer restore()
+	cfg, _, _ := config.NewTestConfig()
+	defer cfg.Out.Close()
+	defer cfg.Err.Close()
+	pinned := runModifyGit(t, repo.root, "rev-parse", "main")
+	nodes := makeNodes(&repo.sf.Stacks[0])
+	nodes[0].PendingAction = &modifyview.PendingAction{Type: modifyview.ActionDrop}
+	nodes[0].Removed = true
+	_, conflict, err := ApplyPlan(cfg, repo.common, &repo.sf.Stacks[0], repo.sf, nodes, "C", noopUpdateBaseSHAs)
+	require.Error(t, err)
+	require.NotNil(t, conflict)
+	require.Equal(t, "B", conflict.Branch)
+
+	// Another stack's rebase moves the trunk during the pause.
+	require.Equal(t, "main", runModifyGit(t, repo.root, "branch", "--show-current"))
+	commitModifyFile(t, repo.root, "trunk.txt", "moved\n", "trunk moves")
+	moved := runModifyGit(t, repo.root, "rev-parse", "main")
+	require.NotEqual(t, pinned, moved)
+
+	require.NoError(t, os.WriteFile(filepath.Join(repo.owners["B"], "base.txt"), []byte("resolved B\n"), 0644))
+	runModifyGit(t, repo.owners["B"], "add", "base.txt")
+	require.ErrorContains(t, ContinueApply(cfg, repo.common, noopUpdateBaseSHAs), "rebase conflict on C")
+	require.NoError(t, os.WriteFile(filepath.Join(repo.origin, "base.txt"), []byte("resolved C\n"), 0644))
+	runModifyGit(t, repo.origin, "add", "base.txt")
+	require.NoError(t, ContinueApply(cfg, repo.common, noopUpdateBaseSHAs))
+
+	saved, err := stack.Load(repo.common)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"B", "C"}, saved.Stacks[0].BranchNames())
+	assert.Equal(t, pinned, runModifyGit(t, repo.root, "merge-base", "main", "B"), "the stack sits on the trunk commit the modify started from")
+	assert.Equal(t, pinned, runModifyGit(t, repo.root, "rev-parse", "B~1"))
+	assert.Equal(t, runModifyGit(t, repo.root, "rev-parse", "B"), runModifyGit(t, repo.root, "rev-parse", "C~1"))
+	assert.Equal(t, pinned, saved.Stacks[0].Branches[0].Base, "the recorded base is the commit the stack sits on")
+	assert.Equal(t, moved, runModifyGit(t, repo.root, "rev-parse", "main"), "the trunk is only read")
+	assert.False(t, StateExists(repo.common))
+}
+
 func TestDistributedModify_RebaseRecovery(t *testing.T) {
 	for _, scenario := range []string{"foreign conflicts", "same-tree remaining branch", "moved owner", "abort renamed owner"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -3930,9 +3983,12 @@ func TestDistributedModify_MetadataSaveFailureRetainsRecovery(t *testing.T) {
 	defer cfg.Err.Close()
 	nodes := makeNodes(&repo.sf.Stacks[0])
 	nodes[0].PendingAction = &modifyview.PendingAction{Type: modifyview.ActionRename, NewName: "new-A"}
-	_, _, err := ApplyPlan(cfg, repo.common, &repo.sf.Stacks[0], repo.sf, nodes, "C", func(*stack.Stack) {
+	_, _, err := ApplyPlan(cfg, repo.common, &repo.sf.Stacks[0], repo.sf, nodes, "C", func(modified *stack.Stack) {
+		modified.Branches[0].Base = "refreshed"
 		external, err := stack.Load(repo.common)
 		require.NoError(t, err)
+		// A writer that ignores the claim changes the stack being modified.
+		external.Stacks[0].Number = 7
 		external.Stacks = append(external.Stacks, stack.Stack{
 			Trunk: stack.BranchRef{Branch: "main"}, Branches: []stack.BranchRef{{Branch: "observer"}},
 		})
@@ -3956,6 +4012,32 @@ func TestDistributedModify_MetadataSaveFailureRetainsRecovery(t *testing.T) {
 	assert.Equal(t, []string{"A", "B", "C"}, final.Stacks[0].BranchNames())
 	assert.Equal(t, []string{"observer"}, final.Stacks[1].BranchNames())
 	assert.False(t, StateExists(repo.common))
+}
+
+func TestDistributedModify_SurvivesWriteToAnotherStack(t *testing.T) {
+	repo := setupDistributedModify(t, false)
+	restore := git.SetOps(requireWorktree(t, git.CurrentOps(), repo.origin))
+	defer restore()
+	cfg, _, _ := config.NewTestConfig()
+	defer cfg.Out.Close()
+	defer cfg.Err.Close()
+	nodes := makeNodes(&repo.sf.Stacks[0])
+	nodes[0].PendingAction = &modifyview.PendingAction{Type: modifyview.ActionRename, NewName: "new-A"}
+	_, conflict, err := ApplyPlan(cfg, repo.common, &repo.sf.Stacks[0], repo.sf, nodes, "C", func(*stack.Stack) {
+		external, err := stack.Load(repo.common)
+		require.NoError(t, err)
+		external.Stacks = append(external.Stacks, stack.Stack{
+			Trunk: stack.BranchRef{Branch: "main"}, Branches: []stack.BranchRef{{Branch: "observer"}},
+		})
+		require.NoError(t, stack.Save(repo.common, external))
+	})
+	require.NoError(t, err)
+	require.Nil(t, conflict)
+	final, err := stack.Load(repo.common)
+	require.NoError(t, err)
+	require.Len(t, final.Stacks, 2)
+	assert.Equal(t, []string{"new-A", "B", "C"}, final.Stacks[0].BranchNames())
+	assert.Equal(t, []string{"observer"}, final.Stacks[1].BranchNames())
 }
 
 func TestDistributedModify_AbortPreservesChangedPendingRef(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	cligit "github.com/cli/cli/v2/git"
+	"github.com/github/gh-stack/internal/stack"
 )
 
 // RebaseOpts holds optional parameters for git rebase operations.
@@ -170,21 +171,57 @@ func (d *defaultOps) CheckoutBranch(name string) error {
 }
 
 func (d *defaultOps) Fetch(remote string) error {
-	c, err := d.gitClient()
-	if err != nil {
-		return err
+	return retryFetch(func() (*cligit.Command, error) {
+		c, err := d.gitClient()
+		if err != nil {
+			return nil, err
+		}
+		cmd, err := c.AuthenticatedCommand(context.Background(), cligit.AllMatchingCredentialsPattern, "fetch", remote)
+		if err != nil {
+			return nil, err
+		}
+		d.configureCommand(cmd)
+		return cmd, nil
+	})
+}
+
+// fetchAttempts bounds how often a fetch is retried after losing a ref update
+// to a concurrent fetch.
+const fetchAttempts = 5
+
+// retryFetch runs a fetch again when another fetch moved one of its refs
+// first. Git reads the old value of a ref before it talks to the remote and
+// refuses the update if the ref changed in the meantime. Commands on stacks
+// that share a trunk fetch that trunk at the same time, so this is routine,
+// and the retry finds the ref up to date.
+func retryFetch(command func() (*cligit.Command, error)) error {
+	var err error
+	for attempt := range fetchAttempts {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
+		}
+		var cmd *cligit.Command
+		if cmd, err = command(); err != nil {
+			return err
+		}
+		// The failure is recognized by its message.
+		cmd.Env = append(cmd.Environ(), "LC_ALL=C")
+		if err = cmd.Run(); err == nil || !strings.Contains(err.Error(), "cannot lock ref") {
+			return err
+		}
 	}
-	cmd, err := c.AuthenticatedCommand(context.Background(), cligit.AllMatchingCredentialsPattern, "fetch", remote)
-	if err != nil {
-		return err
-	}
-	d.configureCommand(cmd)
-	return cmd.Run()
+	return err
+}
+
+func (d *defaultOps) fetchRefs(remote string, refspecs ...string) error {
+	return retryFetch(func() (*cligit.Command, error) {
+		return d.command(append([]string{"fetch", remote}, refspecs...)...)
+	})
 }
 
 func (d *defaultOps) FetchBranch(remote, branch string) error {
 	refspec := fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s", branch, remote, branch)
-	if err := d.runSilent("fetch", remote, refspec); err != nil {
+	if err := d.fetchRefs(remote, refspec); err != nil {
 		if isMissingRemoteRefError(err) {
 			return fmt.Errorf("%w: %s/%s", ErrRemoteBranchNotFound, remote, branch)
 		}
@@ -205,9 +242,7 @@ func (d *defaultOps) FetchBranches(remote string, branches []string) error {
 		refspecs[i] = fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s", b, remote, b)
 	}
 	// Fast path: fetch all branches in a single call.
-	args := []string{"fetch", remote}
-	args = append(args, refspecs...)
-	if err := d.runSilent(args...); err == nil {
+	if err := d.fetchRefs(remote, refspecs...); err == nil {
 		return nil
 	}
 	// Fallback: one branch may be absent on the remote or deleted since
@@ -215,7 +250,7 @@ func (d *defaultOps) FetchBranches(remote string, branches []string) error {
 	// block the rest, while still surfacing real fetch failures.
 	var fetchErr error
 	for _, rs := range refspecs {
-		err := d.runSilent("fetch", remote, rs)
+		err := d.fetchRefs(remote, rs)
 		if err == nil || isMissingRemoteRefError(err) {
 			continue
 		}
@@ -252,7 +287,7 @@ func (d *defaultOps) DefaultBranch() (string, error) {
 }
 
 func (d *defaultOps) CreateBranch(name, base string) error {
-	return d.runSilent("branch", name, base)
+	return d.writeConfig("branch", name, base)
 }
 
 func (d *defaultOps) Push(remote string, branches []string, force, atomic bool) error {
@@ -349,11 +384,26 @@ func (d *defaultOps) Rebase(base string, opts RebaseOpts) error {
 	return d.runRebaseCommand(args, opts)
 }
 
+// writeConfig runs a Git command that writes the clone's shared
+// configuration: a setting, or the upstream section of a branch that is
+// created, renamed, or deleted. Git does not wait for another writer, and a
+// branch rename moves its reflog through one fixed temporary path, so two of
+// these commands at once can fail. gh-stack processes take turns. Without a
+// usable lock the command still runs.
+func (d *defaultOps) writeConfig(args ...string) error {
+	if common, err := d.CommonDir(); err == nil {
+		if lock, err := stack.LockConfig(common); err == nil {
+			defer lock.Unlock()
+		}
+	}
+	return d.runSilent(args...)
+}
+
 func (d *defaultOps) EnableRerere() error {
-	if err := d.runSilent("config", "rerere.enabled", "true"); err != nil {
+	if err := d.writeConfig("config", "rerere.enabled", "true"); err != nil {
 		return err
 	}
-	return d.runSilent("config", "rerere.autoupdate", "true")
+	return d.writeConfig("config", "rerere.autoupdate", "true")
 }
 
 func (d *defaultOps) IsRerereEnabled() (bool, error) {
@@ -381,7 +431,7 @@ func (d *defaultOps) IsRerereDeclined() (bool, error) {
 }
 
 func (d *defaultOps) SaveRerereDeclined() error {
-	return d.runSilent("config", "gh-stack.rerere-declined", "true")
+	return d.writeConfig("config", "gh-stack.rerere-declined", "true")
 }
 
 func (d *defaultOps) GetSavedRemote() (string, error) {
@@ -393,11 +443,11 @@ func (d *defaultOps) GetSavedRemote() (string, error) {
 }
 
 func (d *defaultOps) SaveRemote(remote string) error {
-	return d.runSilent("config", "gh-stack.remote", remote)
+	return d.writeConfig("config", "gh-stack.remote", remote)
 }
 
 func (d *defaultOps) ClearRemote() error {
-	return d.runSilent("config", "--unset", "gh-stack.remote")
+	return d.writeConfig("config", "--unset", "gh-stack.remote")
 }
 
 func (d *defaultOps) RebaseOnto(newBase, oldBase, branch string, opts RebaseOpts) error {
@@ -705,7 +755,7 @@ func (d *defaultOps) DeleteBranch(name string, force bool) error {
 	if force {
 		flag = "-D"
 	}
-	return d.runSilent("branch", flag, name)
+	return d.writeConfig("branch", flag, name)
 }
 
 func (d *defaultOps) DeleteRemoteBranch(remote, branch string) error {
@@ -723,7 +773,7 @@ func (d *defaultOps) ResetHard(ref string) error {
 }
 
 func (d *defaultOps) SetUpstreamTracking(branch, remote string) error {
-	return d.runSilent("branch", "--set-upstream-to="+remote+"/"+branch, branch)
+	return d.writeConfig("branch", "--set-upstream-to="+remote+"/"+branch, branch)
 }
 
 func (d *defaultOps) UpstreamRemote(branch string) (string, error) {
@@ -782,7 +832,7 @@ func (d *defaultOps) ValidateRefName(name string) error {
 }
 
 func (d *defaultOps) RenameBranch(oldName, newName string) error {
-	return d.runSilent("branch", "-m", oldName, newName)
+	return d.writeConfig("branch", "-m", oldName, newName)
 }
 
 func (d *defaultOps) CherryPick(commits []string) error {

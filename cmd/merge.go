@@ -273,6 +273,9 @@ func resolveActiveRemoteStack(cfg *config.Config, client github.ClientOps) (*git
 		return nil, ErrDisambiguate
 	}
 	s := stacks[0]
+	if _, s, err = claimStack(cfg, gitDir, sf, s); err != nil {
+		return nil, stackLookupError(err)
+	}
 	if s.ID == "" && s.Number == 0 {
 		cfg.Errorf("this stack has not been submitted to GitHub yet; run `gh stack submit` first")
 		return nil, ErrNotInStack

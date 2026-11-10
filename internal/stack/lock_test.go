@@ -1,11 +1,14 @@
 package stack
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -165,31 +168,165 @@ func TestLock_TimesOut(t *testing.T) {
 	assert.GreaterOrEqual(t, elapsed, 150*time.Millisecond, "should wait near the timeout")
 }
 
-func TestSave_DetectsStaleFile(t *testing.T) {
+func TestSave_MergesChangesToOtherStacks(t *testing.T) {
 	dir := t.TempDir()
-
-	// Write an initial stack file.
-	sf := &StackFile{SchemaVersion: 1, Stacks: []Stack{}}
+	sf := &StackFile{SchemaVersion: 1, Stacks: []Stack{makeStack("main", "mine"), makeStack("main", "theirs")}}
 	require.NoError(t, Save(dir, sf))
 
-	// Load — captures the on-disk checksum.
 	loaded, err := Load(dir)
 	require.NoError(t, err)
 
-	// Simulate another process: load, modify, save.
+	// Another process changes its own stack, adds one, and removes none of ours.
 	other, err := Load(dir)
 	require.NoError(t, err)
+	other.Stacks[1].Branches[0].Head = "theirs-head"
 	other.AddStack(makeStack("main", "sneaky"))
 	require.NoError(t, Save(dir, other))
 
-	// Our loaded copy tries to save — should detect staleness.
 	loaded.AddStack(makeStack("main", "my-branch"))
-	err = Save(dir, loaded)
-	require.Error(t, err)
+	mine := &loaded.Stacks[0]
+	mine.Branches[0].Head = "mine-head"
+	require.NoError(t, Save(dir, loaded))
 
+	final, err := Load(dir)
+	require.NoError(t, err)
+	require.Len(t, final.Stacks, 4)
+	assert.Equal(t, "mine-head", final.Stacks[0].Branches[0].Head)
+	assert.Equal(t, "theirs-head", final.Stacks[1].Branches[0].Head, "an untouched stack must keep the other writer's change")
+	assert.Equal(t, []string{"sneaky"}, final.Stacks[2].BranchNames())
+	assert.Equal(t, []string{"my-branch"}, final.Stacks[3].BranchNames())
+
+	// The view keeps its own stacks, so earlier pointers stay valid and a
+	// later save still publishes only this view's changes.
+	assert.Same(t, mine, &loaded.Stacks[0])
+	mine.Branches[0].Head = "mine-again"
+	other.Stacks[1].Branches[0].Head = "theirs-again"
+	require.NoError(t, Save(dir, other))
+	require.NoError(t, Save(dir, loaded))
+	final, err = Load(dir)
+	require.NoError(t, err)
+	require.Len(t, final.Stacks, 4)
+	assert.Equal(t, "mine-again", final.Stacks[0].Branches[0].Head)
+	assert.Equal(t, "theirs-again", final.Stacks[1].Branches[0].Head)
+}
+
+func TestSave_DetectsStaleStack(t *testing.T) {
+	for _, change := range []string{"changed", "removed"} {
+		t.Run(change, func(t *testing.T) {
+			dir := t.TempDir()
+			sf := &StackFile{SchemaVersion: 1, Stacks: []Stack{makeStack("main", "shared"), makeStack("main", "bystander")}}
+			require.NoError(t, Save(dir, sf))
+
+			loaded, err := Load(dir)
+			require.NoError(t, err)
+			other, err := Load(dir)
+			require.NoError(t, err)
+			if change == "changed" {
+				other.Stacks[0].Branches[0].Head = "sneaky"
+			} else {
+				other.RemoveStack(0)
+			}
+			require.NoError(t, Save(dir, other))
+			before, err := os.ReadFile(stackFilePath(dir))
+			require.NoError(t, err)
+
+			loaded.Stacks[0].Branches[0].Head = "mine"
+			err = Save(dir, loaded)
+			var staleErr *StaleError
+			require.True(t, errors.As(err, &staleErr), "error should be *StaleError, got %T", err)
+			assert.Contains(t, staleErr.Error(), "modified by another process")
+			after, err := os.ReadFile(stackFilePath(dir))
+			require.NoError(t, err)
+			assert.Equal(t, before, after, "a refused save must not write")
+		})
+	}
+}
+
+func TestSave_RefusesBranchInTwoStacks(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, Save(dir, &StackFile{SchemaVersion: 1, Stacks: []Stack{}}))
+	loaded, err := Load(dir)
+	require.NoError(t, err)
+	other, err := Load(dir)
+	require.NoError(t, err)
+	other.AddStack(makeStack("main", "feature"))
+	require.NoError(t, Save(dir, other))
+
+	loaded.AddStack(makeStack("main", "feature", "more"))
+	err = Save(dir, loaded)
 	var staleErr *StaleError
-	require.True(t, errors.As(err, &staleErr), "error should be *StaleError, got %T", err)
-	assert.Contains(t, staleErr.Error(), "modified by another process")
+	require.ErrorAs(t, err, &staleErr)
+	assert.Contains(t, err.Error(), `branch "feature"`)
+
+	// A trunk may be shared, and may be a branch of another stack.
+	loaded.Stacks[0] = makeStack("feature", "on-top")
+	require.NoError(t, Save(dir, loaded))
+	final, err := Load(dir)
+	require.NoError(t, err)
+	assert.Len(t, final.Stacks, 2)
+}
+
+func TestSave_ReplacesChangedStackInPlace(t *testing.T) {
+	dir := t.TempDir()
+	sf := &StackFile{SchemaVersion: 1, Stacks: []Stack{makeStack("main", "a1", "a2"), makeStack("main", "b1")}}
+	require.NoError(t, Save(dir, sf))
+	loaded, err := Load(dir)
+	require.NoError(t, err)
+	other, err := Load(dir)
+	require.NoError(t, err)
+	other.AddStack(makeStack("main", "c1"))
+	require.NoError(t, Save(dir, other))
+
+	// Rename one branch, drop another, and remove the second stack.
+	loaded.Stacks[0] = makeStack("main", "a1", "a3")
+	loaded.RemoveStack(1)
+	require.NoError(t, Save(dir, loaded))
+
+	final, err := Load(dir)
+	require.NoError(t, err)
+	require.Len(t, final.Stacks, 2)
+	assert.Equal(t, []string{"a1", "a3"}, final.Stacks[0].BranchNames())
+	assert.Equal(t, []string{"c1"}, final.Stacks[1].BranchNames())
+}
+
+func TestSave_ConcurrentWritersOfDifferentStacks(t *testing.T) {
+	dir := t.TempDir()
+	const writers, rounds = 8, 25
+	initial := &StackFile{SchemaVersion: 1}
+	for i := range writers {
+		initial.AddStack(makeStack("main", fmt.Sprintf("branch-%d", i)))
+	}
+	require.NoError(t, Save(dir, initial))
+
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Go(func() {
+			sf, err := Load(dir)
+			if err != nil {
+				errs <- err
+				return
+			}
+			for round := range rounds {
+				sf.Stacks[i].Branches[0].Head = fmt.Sprintf("head-%d-%d", i, round)
+				if err := Save(dir, sf); err != nil {
+					errs <- fmt.Errorf("writer %d round %d: %w", i, round, err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	final, err := Load(dir)
+	require.NoError(t, err)
+	require.Len(t, final.Stacks, writers)
+	for i := range writers {
+		assert.Equal(t, fmt.Sprintf("head-%d-%d", i, rounds-1), final.Stacks[i].Branches[0].Head)
+	}
 }
 
 func TestSave_AllowsWriteWhenFileUnchanged(t *testing.T) {
@@ -629,4 +766,101 @@ func TestMigrateLegacyState_TakesCatalogLock(t *testing.T) {
 	catalog.Unlock()
 	require.NoError(t, MigrateLegacyState(dir))
 	assertMigrationOriginals(t, dir, catalogs, true)
+}
+
+// Writers that own different stacks keep long-lived views and save in a
+// random order. After every save the catalog must hold exactly what each
+// writer last intended for its own stacks.
+func TestSave_RandomizedWritersOfDifferentStacks(t *testing.T) {
+	const writers, steps = 4, 60
+	for seed := range int64(15) {
+		rng := rand.New(rand.NewSource(seed))
+		dir := t.TempDir()
+		created := 0
+		newStack := func(writer int) Stack {
+			created++
+			name := fmt.Sprintf("w%d-s%d", writer, created)
+			return Stack{ID: name, Trunk: BranchRef{Branch: "main"}, Branches: []BranchRef{{Branch: name + "-1"}, {Branch: name + "-2"}}}
+		}
+		// intended[w] maps a stack ID to its JSON as writer w last left it.
+		intended := make([]map[string]string, writers)
+		encode := func(s *Stack) string {
+			data, err := json.Marshal(s)
+			require.NoError(t, err)
+			return string(data)
+		}
+		initial := &StackFile{SchemaVersion: 1}
+		for w := range writers {
+			s := newStack(w)
+			intended[w] = map[string]string{s.ID: encode(&s)}
+			initial.AddStack(s)
+		}
+		require.NoError(t, Save(dir, initial))
+		views := make([]*StackFile, writers)
+		for w := range writers {
+			view, err := Load(dir)
+			require.NoError(t, err)
+			views[w] = view
+		}
+
+		for step := range steps {
+			w := rng.Intn(writers)
+			view := views[w]
+			var owned []int
+			for i := range view.Stacks {
+				if _, ok := intended[w][view.Stacks[i].ID]; ok {
+					owned = append(owned, i)
+				}
+			}
+			action := rng.Intn(7)
+			if len(owned) == 0 {
+				action = 0
+			}
+			var target *Stack
+			if len(owned) > 0 {
+				target = &view.Stacks[owned[rng.Intn(len(owned))]]
+			}
+			switch action {
+			case 0:
+				s := newStack(w)
+				view.AddStack(s)
+				intended[w][s.ID] = encode(&s)
+			case 1:
+				delete(intended[w], target.ID)
+				view.RemoveStack(view.IndexOfStack(target))
+			case 2:
+				target.Branches[len(target.Branches)-1].Branch = fmt.Sprintf("%s-renamed-%d", target.ID, step)
+				intended[w][target.ID] = encode(target)
+			case 3:
+				for i := range target.Branches {
+					target.Branches[i].Branch = fmt.Sprintf("%s-replaced-%d-%d", target.ID, step, i)
+				}
+				intended[w][target.ID] = encode(target)
+			case 4:
+				fresh, err := Load(dir)
+				require.NoError(t, err)
+				views[w] = fresh
+				continue
+			default:
+				target.Branches[0].Head = fmt.Sprintf("head-%d", step)
+				intended[w][target.ID] = encode(target)
+			}
+			require.NoError(t, Save(dir, view), "seed %d step %d writer %d action %d", seed, step, w, action)
+
+			final, err := Load(dir)
+			require.NoError(t, err)
+			var got, want []string
+			for i := range final.Stacks {
+				got = append(got, encode(&final.Stacks[i]))
+			}
+			for w := range writers {
+				for _, s := range intended[w] {
+					want = append(want, s)
+				}
+			}
+			slices.Sort(got)
+			slices.Sort(want)
+			require.Equal(t, want, got, "seed %d step %d writer %d action %d", seed, step, w, action)
+		}
+	}
 }

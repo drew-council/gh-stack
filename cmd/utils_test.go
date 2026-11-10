@@ -155,7 +155,7 @@ func TestStackSelection_RewritePreflightPreservesCheckout(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, beforeCatalog, afterCatalog)
 			assert.FileExists(t, filepath.Join(repo.parentDir, "unfinished.txt"))
-			assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+			assertNoJournal(t, repo.gitDir, rebaseStateFile)
 		})
 	}
 }
@@ -178,27 +178,54 @@ func TestStackMutation_NestedAndReadOnly(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, common, dir)
 
+	// The command runs under its claim, not under the operation lock.
 	lock, acquired, err := stack.TryLockOperation(common)
 	require.NoError(t, err)
-	if lock != nil {
-		defer lock.Unlock()
-	}
-	assert.False(t, acquired)
+	require.True(t, acquired, "a running command must not hold the operation lock")
+	lock.Unlock()
+	require.NotNil(t, state.Operation)
+	assert.True(t, state.Operation.Held())
+	assert.Equal(t, "add", state.Operation.Claim.Kind)
+	assert.Equal(t, []string{currentWorktree()}, state.Operation.Claim.Worktrees)
+	assert.Empty(t, state.Operation.Claim.Branches)
 
 	reader := *cfg
 	reader.StackMutation = nil
 	dir, err = stackStateDir(&reader)
-	require.NoError(t, err, "a reader must not wait on the active operation lock")
+	require.NoError(t, err, "a reader must not wait on a running command")
 	assert.Equal(t, common, dir)
 
 	release()
 	assert.Nil(t, cfg.StackMutation)
+	assert.Empty(t, operationDirs(t, common), "a command that leaves no journal leaves no record")
+	assert.NoDirExists(t, stack.OperationsDir(common))
+	out, _ := commandOutput(t, cfg, outR, errR)
+	assert.Empty(t, out)
+}
+
+// A journal from before claims has no claim to exclude a second recovery, so
+// its recovery keeps the operation lock for the whole command.
+func TestStackMutation_UnclaimedRecoveryIsExclusive(t *testing.T) {
+	common := t.TempDir()
+	restore := git.SetOps(&git.MockOps{GitDirFn: func() (string, error) { return common, nil }})
+	defer restore()
+	require.NoError(t, os.WriteFile(filepath.Join(common, rebaseStateFile), []byte(`{"worktrees":{}}`), 0600))
+	cfg, outR, errR := config.NewTestConfig()
+	defer commandOutput(t, cfg, outR, errR)
+
+	release, err := beginStackMutation(cfg, "rebase-abort")
+	require.NoError(t, err)
+	assert.Nil(t, cfg.StackMutation.Operation)
+	lock, acquired, err := stack.TryLockOperation(common)
+	require.NoError(t, err)
+	require.False(t, acquired, "a second recovery of the same journal must wait")
+	assert.Nil(t, lock)
+
+	release()
 	lock, acquired, err = stack.TryLockOperation(common)
 	require.NoError(t, err)
 	require.True(t, acquired)
 	lock.Unlock()
-	out, _ := commandOutput(t, cfg, outR, errR)
-	assert.Empty(t, out)
 }
 
 func TestStackMutation_RecoveryGuards(t *testing.T) {

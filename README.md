@@ -93,7 +93,7 @@ When you submit, `gh stack` creates one PR per branch and links them together as
 
 Stack metadata is stored in `<common-dir>/gh-stack` (a JSON file, not committed to the repo), where `<common-dir>` is Git's common directory. In a normal clone this is `.git/gh-stack`. All linked worktrees share this catalog, including stack membership, ordering, and PR metadata.
 
-The gh-stack recovery journals, `gh-stack-rebase-state` and `gh-stack-modify-state`, also live in the common directory and record the worktrees involved. Git's own HEAD, index, rebase, and cherry-pick markers remain **per worktree**.
+Each running or paused operation keeps a record under `<common-dir>/gh-stack-operations/`: its claim on branches and worktrees, and its recovery journal (`gh-stack-rebase-state` or `gh-stack-modify-state`). Journals written by gh-stack 0.3.0 and earlier sit directly in the common directory and are recovered from there. Git's own HEAD, index, rebase, and cherry-pick markers remain **per worktree**.
 
 On upgrade, nonconflicting legacy worktree catalogs are consolidated automatically and originals are preserved as backups. Conflicting definitions stop migration rather than choosing one; the error identifies the files to reconcile. Finish or abort legacy in-progress operations in their original worktree first. Do not mix old and new gh-stack versions within one clone.
 
@@ -103,9 +103,13 @@ Complete paused operations before switching preview stages or gh-stack versions.
 
 You can keep independent stacks in linked worktrees or distribute a stack's branches across them. `rebase` and `sync` automatically update the clean worktree that owns each affected branch. Dirty, busy, missing, or changed owners stop the operation; unrelated worktrees are left alone. A trunk that cannot safely fast-forward can use the existing fetched-remote fallback.
 
-Mutations are serialized across the clone, while read-only views remain available. Paused operations must be continued or aborted before another mutation. Recovery runs in the recorded worktree even when `--continue` or `--abort` is invoked elsewhere. gh-stack never automatically stashes changes, creates/removes worktrees, or steals another checkout.
+Commands on independent stacks run at the same time, each from its own worktree. A command claims the stack it works on and the worktrees it uses. Only a command whose claim overlaps a running one waits, for 5 seconds, and then exits with code 8. A paused operation keeps its claim, so its own stack and worktrees wait for `--continue` or `--abort` while every other stack keeps working. Read-only views are always available. gh-stack never automatically stashes changes, creates/removes worktrees, or steals another checkout.
 
-Mutation locks coordinate **gh-stack processes only**, not arbitrary Git commands, editors, or other tools. Keep affected worktrees idle while history is being rewritten. During a pause, make only the requested conflict-resolution edits and staging in the reported worktree.
+Recovery runs in the recorded worktree even when `--continue` or `--abort` is invoked elsewhere. When several operations are paused, run it from a worktree of the one to recover, or with one of its branches checked out.
+
+Stacks share their trunk. One command fast-forwards the local trunk and the others find it up to date. A command that finds the trunk's worktree in use by another operation rebases onto the fetched remote trunk and leaves the local one alone. A stack built on a branch of another stack shares that stack's claim.
+
+Claims coordinate **gh-stack processes only**, not arbitrary Git commands, editors, or other tools. Keep affected worktrees idle while history is being rewritten. During a pause, make only the requested conflict-resolution edits and staging in the reported worktree.
 
 Navigation to a branch checked out elsewhere reports its path and fails without switching. Add `--print-path` to `up`, `down`, `top`, `bottom`, `trunk`, or an explicit-target `checkout` to get the owning path instead. Unoccupied targets are checked out here before printing this worktree's path; successful stdout contains only the absolute path and a newline. See the [worktree workflow](docs/src/content/docs/guides/workflows.md#working-across-git-worktrees) for a shell wrapper that checks errors before changing directories.
 

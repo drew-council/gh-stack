@@ -2,7 +2,6 @@ package stack
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1359,7 +1358,7 @@ func TestMigrateLegacyState_InvalidJournals(t *testing.T) {
 	}
 }
 
-func TestMigrateLegacyState_PreservesStaleDetection(t *testing.T) {
+func TestMigrateLegacyState_SurvivesStaleView(t *testing.T) {
 	dir := t.TempDir()
 	writeMigrationTestCatalog(t, dir, stackFileName, migrationTestFile(makeStack("main", "common")))
 	writeMigrationTestCatalog(t, dir, "worktrees/linked/gh-stack", migrationTestFile(makeStack("main", "linked")))
@@ -1369,11 +1368,14 @@ func TestMigrateLegacyState_PreservesStaleDetection(t *testing.T) {
 	require.NoError(t, err)
 	defer operation.Unlock()
 	require.NoError(t, MigrateLegacyState(dir))
-	err = Save(dir, before)
-	var stale *StaleError
-	require.True(t, errors.As(err, &stale))
+	// A view loaded before the migration must not write the migrated stacks away.
+	before.Stacks[0].Branches[0].Head = "refreshed"
+	require.NoError(t, Save(dir, before))
 	after, err := Load(dir)
 	require.NoError(t, err)
+	require.Len(t, after.Stacks, 2)
+	assert.Equal(t, "refreshed", after.Stacks[0].Branches[0].Head)
+	assert.Equal(t, []string{"linked"}, after.Stacks[1].BranchNames())
 	after.AddStack(makeStack("main", "new"))
 	require.NoError(t, Save(dir, after))
 	require.NoError(t, Save(dir, after), "atomic publication must refresh the load checksum")

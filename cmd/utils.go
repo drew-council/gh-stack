@@ -229,7 +229,8 @@ type loadStackResult struct {
 // branch. It delegates to loadStackOptional, reports when the branch is not in
 // a stack, and returns an error in that case.
 //
-// loadStack does NOT acquire the stack file lock.  The lock is acquired
+// Inside a mutating command, loadStack claims the stack for that command.
+// It does NOT acquire the stack file lock.  The lock is acquired
 // automatically by stack.Save() when writing.
 func loadStack(cfg *config.Config, branch string) (*loadStackResult, error) {
 	result, err := loadStackOptional(cfg, branch)
@@ -282,6 +283,10 @@ func loadStackOptional(cfg *config.Config, branch string) (*loadStackResult, err
 		if err != nil {
 			cfg.Errorf("failed to get current branch: %s", err)
 			return nil, fmt.Errorf("failed to get current branch: %w", err)
+		}
+		// A mutating command works on the stack as it stands under its claim.
+		if sf, s, err = claimStack(cfg, gitDir, sf, s); err != nil {
+			return nil, err
 		}
 	}
 
@@ -409,10 +414,10 @@ func backfillLegacyStackNumbers(cfg *config.Config, sf *stack.StackFile, gitDir 
 		}
 	}
 	if changed {
-		if err := stack.Save(gitDir, sf); err != nil {
-			// Non-fatal: the in-memory backfill still lets us resolve the target.
-			cfg.Warningf("could not persist stack numbers: %v", err)
-		}
+		// The backfill touches stacks this command has no claim on, so it
+		// yields to their operations. The in-memory numbers still resolve
+		// the target, and a later command persists them.
+		stack.SaveNonBlocking(gitDir, sf)
 	}
 	return changed
 }
@@ -1073,6 +1078,10 @@ func ensureLocalTrunk(cfg *config.Config, trunk, remote string) error {
 
 	remoteTrunk := remote + "/" + trunk
 	if err := git.CreateBranch(trunk, remoteTrunk); err != nil {
+		if created, existsErr := git.BranchExists(trunk); existsErr == nil && created {
+			// A command on another stack created the shared trunk first.
+			return nil
+		}
 		return fmt.Errorf("could not create local trunk branch %s from %s: %w", trunk, remoteTrunk, err)
 	}
 
@@ -1328,12 +1337,14 @@ func resolveTrunkTarget(cfg *config.Config, s *stack.Stack, remote, currentBranc
 		if err := preflight(remoteSHA, true); err != nil {
 			return trunkTarget{}, err
 		}
-		if err := git.CreateBranch(trunk, remoteRef); err != nil {
+		if err := git.CreateBranch(trunk, remoteRef); err == nil {
+			cfg.Successf("Created local trunk branch %s from %s", trunk, remoteRef)
+			return trunkTarget{Branch: trunk, Ref: trunk, SHA: remoteSHA, Moved: true}, nil
+		} else if created, existsErr := git.BranchExists(trunk); existsErr != nil || !created {
 			cfg.Errorf("could not create local trunk branch %s from %s: %v", trunk, remoteRef, err)
 			return trunkTarget{}, ErrSilent
 		}
-		cfg.Successf("Created local trunk branch %s from %s", trunk, remoteRef)
-		return trunkTarget{Branch: trunk, Ref: trunk, SHA: remoteSHA, Moved: true}, nil
+		// A command on another stack created the shared trunk first.
 	}
 
 	localSHA, err := git.RevParse(trunk)
@@ -1354,27 +1365,10 @@ func resolveTrunkTarget(cfg *config.Config, s *stack.Stack, remote, currentBranc
 		if err := preflight(remoteSHA, true); err != nil {
 			return trunkTarget{}, err
 		}
-		var updateErr error
-		ops := git.CurrentOps()
-		if opts.Worktrees != nil {
-			ops, updateErr = opts.Worktrees.Ops(trunk)
-			if updateErr == nil {
-				currentBranch, updateErr = ops.CurrentBranch()
-				if updateErr == nil && currentBranch == trunk {
-					updateErr = worktree.CheckClean(ops, opts.Worktrees.Location(trunk).Path)
-				}
-			}
-		}
+		sha, updateErr := fastForwardTrunk(cfg, opts.Worktrees, trunk, remoteRef, localSHA, remoteSHA, currentBranch)
 		if updateErr == nil {
-			if currentBranch == trunk {
-				updateErr = ops.MergeFF(remoteRef)
-			} else {
-				updateErr = ops.UpdateBranchRef(trunk, remoteSHA)
-			}
-		}
-		if updateErr == nil {
-			cfg.Successf("Trunk %s fast-forwarded to %s", trunk, short(remoteSHA))
-			return trunkTarget{Branch: trunk, Ref: trunk, SHA: remoteSHA, Moved: true}, nil
+			cfg.Successf("Trunk %s fast-forwarded to %s", trunk, short(sha))
+			return trunkTarget{Branch: trunk, Ref: trunk, SHA: sha, Moved: true}, nil
 		}
 		cfg.Warningf("Could not update local %s: %v", trunk, updateErr)
 	} else if ffErr != nil {
@@ -1396,6 +1390,74 @@ func resolveTrunkTarget(cfg *config.Config, s *stack.Stack, remote, currentBranc
 	}
 	cfg.Printf("  Rebasing the stack onto %s instead; local %s is unchanged.", remoteRef, trunk)
 	return trunkTarget{Branch: trunk, Ref: remoteRef, SHA: remoteSHA}, nil
+}
+
+// fastForwardTrunk moves the local trunk from localSHA to the fetched remote
+// tip and returns the commit the trunk is at. Stacks share their trunk, so
+// commands on different stacks can attempt this at the same time, each with
+// its own fetch, and the worktree that holds the trunk may be in use by one
+// of them.
+func fastForwardTrunk(cfg *config.Config, ctx *worktree.Context, trunk, remoteRef, localSHA, remoteSHA, currentBranch string) (string, error) {
+	if common, err := git.CommonDir(); err == nil {
+		lock, err := stack.LockTrunk(common, stack.LockTimeout)
+		var busy *stack.LockError
+		if errors.As(err, &busy) {
+			return "", err
+		}
+		defer lock.Unlock()
+		// Another command may have moved the trunk since it was read.
+		if current, err := git.RevParse(trunk); err == nil && current != localSHA {
+			if current == remoteSHA {
+				return remoteSHA, nil
+			}
+			// A later fetch already took the trunk past this one. It MUST
+			// NOT move backwards.
+			if ahead, err := git.IsAncestor(remoteSHA, current); err == nil && ahead {
+				return current, nil
+			}
+			if behind, err := git.IsAncestor(current, remoteSHA); err != nil || !behind {
+				return "", fmt.Errorf("%s changed and no longer fast-forwards to %s", trunk, remoteRef)
+			}
+		}
+	}
+	ops := git.CurrentOps()
+	owner := ""
+	if ctx != nil {
+		var err error
+		if ops, err = ctx.Ops(trunk); err != nil {
+			return "", err
+		}
+		if currentBranch, err = ops.CurrentBranch(); err != nil {
+			return "", err
+		}
+		owner = ctx.Location(trunk).Path
+	}
+	if currentBranch != trunk {
+		// Git refuses to move a branch that is checked out anywhere.
+		return remoteSHA, ops.UpdateBranchRef(trunk, remoteSHA)
+	}
+	if owner != "" {
+		release, ok := tryClaimWorktree(cfg, owner)
+		if !ok {
+			return "", fmt.Errorf("worktree %s is in use by another gh-stack operation", owner)
+		}
+		if release != nil {
+			defer release()
+			// The claim keeps other commands out from here on. Look again.
+			current, err := ops.CurrentBranch()
+			if err != nil {
+				return "", err
+			}
+			if current != trunk {
+				return remoteSHA, ops.UpdateBranchRef(trunk, remoteSHA)
+			}
+		}
+		if err := worktree.CheckClean(ops, owner); err != nil {
+			return "", err
+		}
+	}
+	// Merge the commit, not the remote ref: a later fetch may have moved it.
+	return remoteSHA, ops.MergeFF(remoteSHA)
 }
 
 func trunkWithoutRemote(cfg *config.Config, trunk, remote string) (trunkTarget, error) {
@@ -2240,6 +2302,10 @@ func pullRemoteAdditions(cfg *config.Config, sf *stack.StackFile, s *stack.Stack
 	newBranchNames := make([]string, len(newPRs))
 	for i, pr := range newPRs {
 		newBranchNames[i] = pr.HeadRefName
+	}
+	// The pulled branches join the stack, and so its claim.
+	if err := claim(cfg, newBranchNames, nil); err != nil {
+		return res, err
 	}
 	_ = git.FetchBranches(remote, newBranchNames)
 
