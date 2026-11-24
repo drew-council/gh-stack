@@ -40,8 +40,9 @@ Rebase `drew/local-patches` onto the latest stable upstream release. This should
    ```
 
 8. Resolve conflicts according to the original commit's intent and the target release's current design. Do not blindly choose `ours` or `theirs`.
-9. Review the result with `git range-diff`, inspect the cumulative diff, run `git diff --check`, and run `gofmt -l .`, `go vet ./...`, and then `go run ./scripts/test -workers 4`.
-10. Push the backup first, then the branch. Pin the lease to the remote tip seen before the rebase:
+9. Set `release` in `flake.nix` to the target release. If `go.mod` or `go.sum` changed, update `vendorHash`. Amend both into the commit that adds the flake.
+10. Review the result with `git range-diff`, inspect the cumulative diff, run `git diff --check`, and run `gofmt -l .`, `go vet ./...`, `go run ./scripts/test -workers 4`, and then `nix flake check`.
+11. Push the backup first, then the branch. Pin the lease to the remote tip seen before the rebase:
 
    ```bash
    git push fork <backup>
