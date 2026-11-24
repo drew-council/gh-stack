@@ -133,7 +133,11 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 	// Verify that the repository has stacked PRs enabled.
 	stacksAvailable := s.ID != ""
 	if !stacksAvailable {
-		if _, err := client.ListStacks(); err != nil {
+		if err := client.ProbeStacks(); err != nil {
+			if !isNotFound(err) {
+				cfg.Errorf("failed to check whether stacked PRs are available: %v", err)
+				return ErrAPIFailure
+			}
 			warnStacksUnavailable(cfg)
 			if cfg.IsInteractive() {
 				p := prompter.New(cfg.In, cfg.Out, cfg.Err)
@@ -992,12 +996,22 @@ func prsMissingFrom(remote, local []int) []int {
 // to compute the delta; when the desired list isn't a clean append onto the
 // remote stack (a reorder or a removal, e.g. merged PRs leaving the stack) it
 // leaves the remote stack untouched. If the remote stack is gone (404) it
-// clears the local ID and re-creates it. Returns true when the remote stack
-// reflects the local stack (updated, already in sync, or recreated).
+// clears the local ID and re-creates it. If the stack number lookup fails, it
+// keeps the local ID, since the remote stack may still exist. Returns true when
+// the remote stack reflects the local stack (updated, already in sync, or
+// recreated).
 func updateStack(cfg *config.Config, client github.ClientOps, s *stack.Stack) bool {
 	number, err := ensureStackNumber(client, s)
-	if err != nil || number == 0 {
-		// Can't resolve the remote stack — treat as missing and (re)create.
+	if err != nil {
+		if isNotFound(err) {
+			warnStacksUnavailable(cfg)
+		} else {
+			cfg.Warningf("Failed to look up stack on GitHub: %v", err)
+		}
+		return false
+	}
+	if number == 0 {
+		// The remote stack no longer exists, so (re)create it.
 		s.ID = ""
 		s.Number = 0
 		return createNewStack(cfg, client, s)

@@ -11,6 +11,7 @@ type MockClient struct {
 	UpdatePRBaseFn             func(int, string) error
 	MarkPRReadyForReviewFn     func(string) error
 	DisableAutoMergeFn         func(string) error
+	ProbeStacksFn              func() error
 	ListStacksFn               func() ([]RemoteStack, error)
 	FindStackForPRFn           func(int) (*RemoteStack, error)
 	GetStackFn                 func(int) (*RemoteStack, error)
@@ -72,6 +73,13 @@ func (m *MockClient) MarkPRReadyForReview(prID string) error {
 func (m *MockClient) DisableAutoMerge(prID string) error {
 	if m.DisableAutoMergeFn != nil {
 		return m.DisableAutoMergeFn(prID)
+	}
+	return nil
+}
+
+func (m *MockClient) ProbeStacks() error {
+	if m.ProbeStacksFn != nil {
+		return m.ProbeStacksFn()
 	}
 	return nil
 }

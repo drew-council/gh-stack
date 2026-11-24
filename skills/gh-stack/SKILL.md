@@ -155,7 +155,7 @@ an ancestor of the branch.
 | 6 | Disambiguation required | Branch is in several stacks; check out a non-shared branch |
 | 7 | Rebase already in progress | `gh stack rebase --continue` or `--abort` |
 | 8 | Stack file locked | Another `gh stack` process is writing; retry after ~5s |
-| 9 | Stacked PRs unavailable | Not enabled on the repository; tell the user |
+| 9 | Stacked PRs unavailable | Not enabled on the repository, or the active account cannot access it. Check `gh auth status`; tell the user |
 | 10 | Modify recovery required | `gh stack modify --abort` |
 
 **Exit 3 recovery:**

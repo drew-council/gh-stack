@@ -75,10 +75,13 @@ func printInterrupt(cfg *config.Config) {
 	cfg.Infof("Received interrupt, aborting operation")
 }
 
-// warnStacksUnavailable prints a warning when a stacks API call returns 404,
-// indicating stacked PRs are not enabled for the repository.
+// warnStacksUnavailable prints a warning when a stacks API call returns 404.
+// GitHub answers 404 when stacked PRs are not enabled,
+// and also when the active account cannot see the repository.
+// Callers MUST report any other error as an API failure.
 func warnStacksUnavailable(cfg *config.Config) {
-	cfg.Warningf("Stacked PRs are not enabled for this repository")
+	cfg.Warningf("Stacked PRs are not enabled for this repository, or the active account cannot access it")
+	cfg.Printf("  Run `%s` to check the active account", cfg.ColorAccent("gh auth status"))
 }
 
 // stackLabel returns a " (stack #N)" suffix for appending to user-facing

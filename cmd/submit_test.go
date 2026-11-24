@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -1636,8 +1637,8 @@ func TestSubmit_PreflightCheck_404_BailsOut(t *testing.T) {
 	// Non-interactive config — should bail out immediately.
 	cfg, _, errR := config.NewTestConfig()
 	cfg.GitHubClientOverride = &github.MockClient{
-		ListStacksFn: func() ([]github.RemoteStack, error) {
-			return nil, &api.HTTPError{StatusCode: 404, Message: "Not Found"}
+		ProbeStacksFn: func() error {
+			return &api.HTTPError{StatusCode: 404, Message: "Not Found"}
 		},
 	}
 
@@ -1689,8 +1690,8 @@ func TestSubmit_PreflightCheck_404_Interactive_UserDeclinesAborts(t *testing.T) 
 	cfg.In = inR
 	cfg.ForceInteractive = true
 	cfg.GitHubClientOverride = &github.MockClient{
-		ListStacksFn: func() ([]github.RemoteStack, error) {
-			return nil, &api.HTTPError{StatusCode: 404, Message: "Not Found"}
+		ProbeStacksFn: func() error {
+			return &api.HTTPError{StatusCode: 404, Message: "Not Found"}
 		},
 	}
 
@@ -1709,6 +1710,128 @@ func TestSubmit_PreflightCheck_404_Interactive_UserDeclinesAborts(t *testing.T) 
 	assert.ErrorIs(t, err, ErrStacksUnavailable)
 	assert.Contains(t, output, "Stacked PRs are not enabled for this repository")
 	assert.False(t, pushed, "should not push when user declines")
+}
+
+func TestSubmit_PreflightCheck_OtherErrors(t *testing.T) {
+	reqURL := &url.URL{Scheme: "https", Host: "api.github.com", Path: "/repos/o/r/stacks"}
+	tests := map[string]struct {
+		err  error
+		want string
+	}{
+		"server error":    {&api.HTTPError{StatusCode: 502, Message: "Bad Gateway", RequestURL: reqURL}, "HTTP 502: Bad Gateway"},
+		"rate limit":      {&api.HTTPError{StatusCode: 403, Message: "secondary rate limit", RequestURL: reqURL}, "HTTP 403: secondary rate limit"},
+		"bad credentials": {&api.HTTPError{StatusCode: 401, Message: "Bad credentials", RequestURL: reqURL}, "HTTP 401: Bad credentials"},
+		"non-HTTP error":  {errors.New("dial tcp: i/o timeout"), "dial tcp: i/o timeout"},
+	}
+	for name, tt := range tests {
+		for _, interactive := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/interactive=%t", name, interactive), func(t *testing.T) {
+				dir := t.TempDir()
+				writeStackFile(t, dir, stack.Stack{
+					Trunk:    stack.BranchRef{Branch: "main"},
+					Branches: []stack.BranchRef{{Branch: "b1"}, {Branch: "b2"}},
+				})
+				mock := newSubmitMock(dir, "b1")
+				mock.PushFn = func(string, []string, bool, bool) error {
+					t.Error("must not push when the probe fails")
+					return nil
+				}
+				defer git.SetOps(mock)()
+
+				cfg, outR, errR := config.NewTestConfig()
+				cfg.ForceInteractive = interactive
+				cfg.GitHubClientOverride = &github.MockClient{
+					ProbeStacksFn: func() error { return tt.err },
+				}
+				setTestRepo(cfg)
+
+				err := runSubmit(cfg, &submitOptions{auto: true})
+				out, diagnostics := commandOutput(t, cfg, outR, errR)
+
+				assert.ErrorIs(t, err, ErrAPIFailure)
+				assert.Contains(t, diagnostics, tt.want)
+				assert.NotContains(t, diagnostics, "not enabled")
+				assert.NotContains(t, out+diagnostics, "create regular PRs")
+			})
+		}
+	}
+}
+
+func TestSubmit_ListFailureAfterProbeStillSubmits(t *testing.T) {
+	dir := t.TempDir()
+	writeStackFile(t, dir, stack.Stack{
+		Trunk:    stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{{Branch: "b1"}, {Branch: "b2"}},
+	})
+	mock := newSubmitMock(dir, "b1")
+	mock.LogRangeFn = func(_, head string) ([]git.CommitInfo, error) {
+		return []git.CommitInfo{{Subject: "commit for " + head}}, nil
+	}
+	defer git.SetOps(mock)()
+
+	next := 10
+	var created []int
+	cfg, outR, errR := config.NewTestConfig()
+	cfg.GitHubClientOverride = &github.MockClient{
+		ListStacksFn: func() ([]github.RemoteStack, error) {
+			return nil, &api.HTTPError{StatusCode: 502, Message: "Bad Gateway", RequestURL: &url.URL{Path: "/repos/o/r/stacks"}}
+		},
+		CreatePRFn: func(base, head, _, _ string, _ bool) (*github.PullRequest, error) {
+			pr := &github.PullRequest{Number: next, State: "OPEN", HeadRefName: head, BaseRefName: base}
+			next++
+			return pr, nil
+		},
+		CreateStackFn: func(numbers []int) (*github.RemoteStack, error) {
+			created = numbers
+			return &github.RemoteStack{ID: 42, Number: 7, PullRequests: numbers}, nil
+		},
+	}
+	setTestRepo(cfg)
+
+	err := runSubmit(cfg, &submitOptions{auto: true})
+	_, diagnostics := commandOutput(t, cfg, outR, errR)
+
+	require.NoError(t, err)
+	assert.Equal(t, []int{10, 11}, created)
+	assert.NotContains(t, diagnostics, "not enabled")
+}
+
+func TestUpdateStack_LookupFailureKeepsRemoteStack(t *testing.T) {
+	reqURL := &url.URL{Path: "/repos/o/r/stacks"}
+	tests := map[string]struct {
+		err  error
+		want string
+	}{
+		"not found":      {&api.HTTPError{StatusCode: 404, Message: "Not Found", RequestURL: reqURL}, "not enabled"},
+		"server error":   {&api.HTTPError{StatusCode: 502, Message: "Bad Gateway", RequestURL: reqURL}, "HTTP 502: Bad Gateway"},
+		"non-HTTP error": {errors.New("dial tcp: i/o timeout"), "dial tcp: i/o timeout"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			s := &stack.Stack{
+				ID:    "42",
+				Trunk: stack.BranchRef{Branch: "main"},
+				Branches: []stack.BranchRef{
+					{Branch: "b1", PullRequest: &stack.PullRequestRef{Number: 10}},
+					{Branch: "b2", PullRequest: &stack.PullRequestRef{Number: 11}},
+				},
+			}
+			client := &github.MockClient{
+				ListStacksFn: func() ([]github.RemoteStack, error) { return nil, tt.err },
+				CreateStackFn: func([]int) (*github.RemoteStack, error) {
+					t.Error("must not recreate a stack after a failed lookup")
+					return nil, errors.New("unexpected create")
+				},
+			}
+			cfg, outR, errR := config.NewTestConfig()
+
+			assert.False(t, updateStack(cfg, client, s))
+
+			_, diagnostics := commandOutput(t, cfg, outR, errR)
+			assert.Equal(t, "42", s.ID)
+			assert.Contains(t, diagnostics, tt.want)
+		})
+	}
 }
 
 func TestSyncStack_SkippedWhenStacksUnavailable(t *testing.T) {

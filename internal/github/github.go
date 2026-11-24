@@ -507,9 +507,18 @@ func (s *RemoteStack) PRNumbers() []int {
 	return s.PullRequests
 }
 
+// ProbeStacks checks with a single request that the stacks API is available for
+// the repository. A 404 response indicates stacked PRs are not enabled for the
+// repository, or the active account cannot access it.
+func (c *Client) ProbeStacks() error {
+	path := fmt.Sprintf("repos/%s/%s/stacks?per_page=1", c.owner, c.repo)
+	var stacks []json.RawMessage
+	return c.rest.Get(path, &stacks)
+}
+
 // ListStacks returns all stacks in the repository, ordered by stack number
-// (descending). Returns an empty slice if no stacks exist. A 404 response
-// indicates stacked PRs are not enabled for this repository.
+// (descending). Returns an empty slice if no stacks exist. A 404 response has
+// the same meaning as for ProbeStacks.
 func (c *Client) ListStacks() ([]RemoteStack, error) {
 	const perPage = 100
 

@@ -791,5 +791,5 @@ GH_STACK_BACKGROUND=terminal gh stack submit
 | 6 | Disambiguation required (branch belongs to multiple stacks) |
 | 7 | Rebase already in progress |
 | 8 | Stack is locked by another process |
-| 9 | Stacked PRs not enabled for this repository |
+| 9 | Stacked PRs not enabled for this repository, or the active account cannot access it |
 | 10 | Modify session interrupted (recovery required) |

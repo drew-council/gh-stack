@@ -1909,6 +1909,8 @@ func TestWarnStacksUnavailable_ShowsNotEnabled(t *testing.T) {
 	output := string(errOut)
 
 	assert.Contains(t, output, "Stacked PRs are not enabled for this repository")
+	assert.Contains(t, output, "active account cannot access it")
+	assert.Contains(t, output, "gh auth status")
 }
 
 func TestEnsureLocalTrunk_AlreadyExists(t *testing.T) {

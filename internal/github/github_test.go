@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/cli/go-gh/v2/pkg/api"
@@ -264,4 +265,77 @@ func TestListStacks_Paginates(t *testing.T) {
 	assert.Equal(t, []int{1, 2}, requestedPages)
 	assert.Equal(t, 101, stacks[0].Number)
 	assert.Equal(t, 1, stacks[100].Number)
+}
+
+func stacksTestClient(t *testing.T, respond func(*http.Request) (int, string)) *Client {
+	t.Helper()
+	rest, err := api.NewRESTClient(api.ClientOptions{
+		Host:      "github.com",
+		AuthToken: "x",
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			status, body := respond(r)
+			return &http.Response{
+				StatusCode: status,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Request:    r,
+			}, nil
+		}),
+	})
+	require.NoError(t, err)
+	return &Client{rest: rest, owner: "o", repo: "r"}
+}
+
+func TestProbeStacks(t *testing.T) {
+	tests := map[string]struct {
+		status     int
+		body       string
+		wantStatus int
+	}{
+		"stacks":       {200, `[{"id": 1, "number": 1}]`, 0},
+		"no stacks":    {200, `[]`, 0},
+		"not found":    {404, `{"message": "Not Found"}`, 404},
+		"server error": {502, `{"message": "Bad Gateway"}`, 502},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			var requests []string
+			client := stacksTestClient(t, func(r *http.Request) (int, string) {
+				requests = append(requests, r.URL.RequestURI())
+				return tt.status, tt.body
+			})
+
+			err := client.ProbeStacks()
+
+			assert.Equal(t, []string{"/repos/o/r/stacks?per_page=1"}, requests)
+			if tt.wantStatus == 0 {
+				require.NoError(t, err)
+				return
+			}
+			var httpErr *api.HTTPError
+			require.ErrorAs(t, err, &httpErr)
+			assert.Equal(t, tt.wantStatus, httpErr.StatusCode)
+		})
+	}
+}
+
+func TestProbeStacks_UnaffectedBySecondPageFailure(t *testing.T) {
+	firstPage, err := json.Marshal(make([]struct {
+		ID int `json:"id"`
+	}, 100))
+	require.NoError(t, err)
+	client := stacksTestClient(t, func(r *http.Request) (int, string) {
+		if r.URL.Query().Get("page") == "2" {
+			return 502, `{"message": "Bad Gateway"}`
+		}
+		return 200, string(firstPage)
+	})
+
+	require.NoError(t, client.ProbeStacks())
+
+	stacks, err := client.ListStacks()
+	assert.Nil(t, stacks)
+	var httpErr *api.HTTPError
+	require.ErrorAs(t, err, &httpErr)
+	assert.Equal(t, 502, httpErr.StatusCode)
 }
